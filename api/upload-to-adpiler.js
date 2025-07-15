@@ -43,7 +43,26 @@ export default async function handler(req, res) {
   console.log('🪪 Card ID:', cardId);
   console.log('📝 Card title:', cardTitle);
 
-  const clientName = cardTitle.split(':')[0]?.trim().toLowerCase();
+  const clientName = cardTitle.split(':')[0]?.trim();
+console.log('👤 Client from card title:', clientName);
+
+if (Object.keys(clientIdMap).length === 0) {
+  await fetchClientIds();
+}
+
+// Case-insensitive match from CSV map
+const matchedEntry = Object.entries(clientIdMap).find(
+  ([key]) => key.toLowerCase() === clientName.toLowerCase()
+);
+const clientId = matchedEntry?.[1];
+
+console.log('✅ Matched client ID:', clientId);
+
+if (!clientId) {
+  console.error('❌ No matching client ID found.');
+  return res.status(400).send('Client ID not found.');
+}
+
   console.log('👤 Client from card title:', clientName);
 
   if (Object.keys(clientIdMap).length === 0) {
