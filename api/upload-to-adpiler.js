@@ -1,4 +1,3 @@
-import { buffer } from 'micro';
 import csv from 'csvtojson';
 
 const SHEET_CSV_URL = 'https://docs.google.com/spreadsheets/d/1c1V-8rdHtn3sWihB0cWRgPG3OhuqjtpymzjdguEsvs4/export?format=csv';
@@ -9,19 +8,24 @@ export const config = {
   },
 };
 
-export default async function handler(req, res) {
-  if (req.method === 'HEAD') {
-    return res.status(200).end(); // For webhook verification
-  }
+// Parse raw body as buffer
+async function getRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = [];
+    req
+      .on('data', chunk => data.push(chunk))
+      .on('end', () => resolve(Buffer.concat(data).toString()))
+      .on('error', reject);
+  });
+}
 
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+export default async function handler(req, res) {
+  if (req.method === 'HEAD') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
     console.log('📩 Webhook received from Trello');
-
-    const rawBody = (await buffer(req)).toString();
+    const rawBody = await getRawBody(req);
     const webhookPayload = JSON.parse(rawBody);
     console.log('📨 Request Body:', webhookPayload);
 
@@ -41,12 +45,9 @@ export default async function handler(req, res) {
     const clientName = (cardTitle.split(':')[0] || '').trim().toLowerCase();
     console.log('👤 Client from card title:', clientName);
 
-    // 🔄 Pull CSV and find matching AdPiler client ID
     const response = await fetch(SHEET_CSV_URL);
     const csvText = await response.text();
     const rows = await csv().fromString(csvText);
-
-    console.log('📄 CSV Rows Fetched:', rows);
 
     const clientMatch = rows.find((row) => {
       const name = row['Trello Client Name'];
@@ -61,7 +62,6 @@ export default async function handler(req, res) {
     const adpilerClientId = clientMatch['AdPiler Client ID'];
     console.log('✅ Matched client ID:', adpilerClientId);
 
-    // 🧲 Fetch full card data
     const cardResp = await fetch(`https://api.trello.com/1/cards/${cardId}?attachments=true&customFieldItems=true&checklists=all&fields=all&key=${process.env.TRELLO_API_KEY}&token=${process.env.TRELLO_TOKEN}`);
     const card = await cardResp.json();
     console.log('📎 Full card response from Trello:', card);
