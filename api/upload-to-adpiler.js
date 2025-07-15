@@ -1,11 +1,5 @@
 import fetch from 'node-fetch';
 
-export const config = {
-  api: {
-    bodyParser: true,
-  },
-};
-
 const CLIENT_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSlL2KhvYcVnG2AUkT1DtFu9hGRfbYvT1B5wePkmglr1cVeK8EjUySRIgqE3FEsGw/pub?gid=0&single=true&output=csv';
 
 let clientIdMap = {};
@@ -13,13 +7,19 @@ let clientIdMap = {};
 async function fetchClientIds() {
   const res = await fetch(CLIENT_CSV_URL);
   const csv = await res.text();
-  const lines = csv.split('\n').slice(1); // skip header
-  for (const line of lines) {
-    const [client, id] = line.split(',').map(s => s.trim().toLowerCase());
-    if (client && id) clientIdMap[client] = id;
-  }
-}
+  const lines = csv.split('\n').slice(1); // skip header row
 
+  for (const line of lines) {
+    const [clientRaw, idRaw] = line.split(',');
+    const client = clientRaw?.trim();
+    const id = idRaw?.trim();
+    if (client && id) {
+      clientIdMap[client.toLowerCase()] = id;
+    }
+  }
+
+  console.log('🧾 Client Map:', clientIdMap);
+}
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -44,32 +44,20 @@ export default async function handler(req, res) {
   console.log('📝 Card title:', cardTitle);
 
   const clientName = cardTitle.split(':')[0]?.trim();
-console.log('👤 Client from card title:', clientName);
-
-if (Object.keys(clientIdMap).length === 0) {
-  await fetchClientIds();
-}
-
-// Case-insensitive match from CSV map
-const matchedEntry = Object.entries(clientIdMap).find(
-  ([key]) => key.toLowerCase() === clientName.toLowerCase()
-);
-const clientId = matchedEntry?.[1];
-
-console.log('✅ Matched client ID:', clientId);
-
-if (!clientId) {
-  console.error('❌ No matching client ID found.');
-  return res.status(400).send('Client ID not found.');
-}
-
   console.log('👤 Client from card title:', clientName);
 
   if (Object.keys(clientIdMap).length === 0) {
     await fetchClientIds();
   }
 
-  const clientId = clientIdMap[clientName];
+  let clientId;
+  for (const [key, value] of Object.entries(clientIdMap)) {
+    if (key.toLowerCase() === clientName.toLowerCase()) {
+      clientId = value;
+      break;
+    }
+  }
+
   console.log('✅ Matched client ID:', clientId);
 
   if (!clientId) {
@@ -81,7 +69,7 @@ if (!clientId) {
   const card = await trelloCardResp.json();
   console.log('📎 Full card response from Trello:', card);
 
-  const folderMatch = card.desc.match(/\*\*Folder:\s*(.+?)\*\*/);
+  const folderMatch = card.desc?.match(/\*\*Folder:\s*(.+?)\*\*/);
   const folder = folderMatch ? folderMatch[1].trim() : 'Uncategorized';
   const notes = card.desc || '';
 
@@ -120,3 +108,4 @@ if (!clientId) {
 
   res.status(200).send('Upload successful.');
 }
+
