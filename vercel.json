@@ -1,7 +1,15 @@
 {
-  "functions": {
-    "api/upload-to-adpiler.js": {
-      "runtime": "nodejs18.x"
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/upload-to-adpiler.js",
+      "use": "@vercel/node"
     }
-  }
+  ],
+  "routes": [
+    {
+      "src": "/api/upload-to-adpiler",
+      "dest": "/api/upload-to-adpiler.js"
+    }
+  ]
 }
