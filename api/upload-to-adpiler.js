@@ -1,113 +1,84 @@
-import fetch from 'node-fetch';
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
 
-const CLIENT_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pubhtml';
+// ✅ CORRECT published Google Sheet CSV link
+const CLIENT_CSV_URL =
+  'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
 
 let clientIdMap = {};
 
 async function fetchClientIds() {
   const res = await fetch(CLIENT_CSV_URL);
   const csv = await res.text();
-  console.log('📄 Raw CSV:', csv); // 👈 Add this line
-  
-  const lines = csv.split('\n').slice(1); // skip header row
+  const lines = csv.split('\n').slice(1); // Skip header
 
   for (const line of lines) {
     const [clientRaw, idRaw] = line.split(',');
-    const client = clientRaw?.trim();
+    const client = clientRaw?.trim(); // ✅ Preserve original case
     const id = idRaw?.trim();
     if (client && id) {
-      clientIdMap[client.toLowerCase()] = id;
+      clientIdMap[client] = id;
     }
   }
 
   console.log('🧾 Client Map:', clientIdMap);
 }
 
-export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).send('Method not allowed');
-  }
-
-  const body = req.body;
-  console.log('📩 Webhook received from Trello');
-  console.log('📨 Request Body:', JSON.stringify(body, null, 2));
-
-  const action = body?.action;
-  const listName = action?.data?.listAfter?.name;
-  const cardId = action?.data?.card?.id;
-  const cardTitle = action?.data?.card?.name || '';
-
-  if (listName !== 'Ready for AdPiler') {
-    return res.status(200).send('Not the right list. Ignoring.');
-  }
-
-  console.log('📌 List moved to:', listName);
-  console.log('🪪 Card ID:', cardId);
-  console.log('📝 Card title:', cardTitle);
-
-  const clientName = cardTitle.split(':')[0]?.trim();
-  console.log('👤 Client from card title:', clientName);
-
-  if (Object.keys(clientIdMap).length === 0) {
-    await fetchClientIds();
-  }
-
-  let clientId;
-  for (const [key, value] of Object.entries(clientIdMap)) {
-    if (key.toLowerCase() === clientName.toLowerCase()) {
-      clientId = value;
-      break;
-    }
-  }
-
-  console.log('✅ Matched client ID:', clientId);
-
-  if (!clientId) {
-    console.error('❌ No matching client ID found.');
-    return res.status(400).send('Client ID not found.');
-  }
-
-  const trelloCardResp = await fetch(`https://api.trello.com/1/cards/${cardId}?attachments=true&fields=desc,url,name&key=${process.env.TRELLO_API_KEY}&token=${process.env.TRELLO_TOKEN}`);
-  const card = await trelloCardResp.json();
-  console.log('📎 Full card response from Trello:', card);
-
-  const folderMatch = card.desc?.match(/\*\*Folder:\s*(.+?)\*\*/);
-  const folder = folderMatch ? folderMatch[1].trim() : 'Uncategorized';
-  const notes = card.desc || '';
-
-  const files = (card.attachments || []).map(file => ({
-    fileUrl: file.url,
-    fileName: file.name
-  }));
-
-  const payload = {
-    client_id: clientId,
-    folder,
-    files,
-    notes,
-    build_link: '---',
-    card_url: card.shortUrl
-  };
-
-  console.log('⬆️ Uploading to AdPiler:', payload);
-
-  const adpilerUpload = await fetch('https://api.adpiler.com/v1/upload-files', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-API-KEY': process.env.ADPILER_API_KEY
-    },
-    body: JSON.stringify(payload)
-  });
-
-  const uploadResult = await adpilerUpload.json();
-  console.log('✅ AdPiler Upload Result:', uploadResult);
-
-  if (!adpilerUpload.ok) {
-    console.error('❌ Upload to AdPiler failed:', uploadResult);
-    return res.status(500).send('AdPiler upload failed.');
-  }
-
-  res.status(200).send('Upload successful.');
+function extractClientName(cardTitle) {
+  return cardTitle.split(':')[0]?.trim(); // "Zia Clovis" from "Zia Clovis: Carousel Ad"
 }
 
+function findClientId(caseInsensitiveName) {
+  for (const clientName in clientIdMap) {
+    if (clientName.toLowerCase() === caseInsensitiveName.toLowerCase()) {
+      return clientIdMap[clientName]; // Return ID using original-cased key
+    }
+  }
+  return undefined;
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).send('Method Not Allowed');
+  }
+
+  let body = '';
+  req.on('data', chunk => {
+    body += chunk;
+  });
+
+  req.on('end', async () => {
+    const payload = JSON.parse(body);
+
+    console.log('📩 Webhook received from Trello');
+    console.log('📨 Request Body:', payload);
+
+    const listName = payload.action?.data?.listAfter?.name;
+    const cardId = payload.action?.data?.card?.id;
+    const cardTitle = payload.action?.data?.card?.name;
+
+    console.log('📌 List moved to:', listName);
+    console.log('🪪 Card ID:', cardId);
+    console.log('📝 Card title:', cardTitle);
+
+    const clientFromCard = extractClientName(cardTitle);
+    console.log('👤 Client from card title:', clientFromCard);
+
+    await fetchClientIds();
+
+    const clientId = findClientId(clientFromCard);
+    console.log('✅ Matched client ID:', clientId);
+
+    if (!clientId) {
+      console.error('❌ No matching client ID found.');
+      return res.status(400).send('Client ID not found');
+    }
+
+    // 🔜 Insert AdPiler API logic here if desired
+
+    return res.status(200).send('Webhook processed successfully');
+  });
+}
