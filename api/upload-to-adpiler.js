@@ -3,9 +3,7 @@ import { FormData } from 'formdata-node';
 import csv from 'csvtojson';
 import https from 'https';
 
-export const config = {
-  runtime: 'edge',
-};
+export const config = { runtime: 'edge' };
 
 const GOOGLE_SHEET_CSV_URL =
   'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
