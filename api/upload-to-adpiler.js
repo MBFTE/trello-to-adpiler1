@@ -7,6 +7,8 @@ let clientIdMap = {};
 async function fetchClientIds() {
   const res = await fetch(CLIENT_CSV_URL);
   const csv = await res.text();
+  console.log('📄 Raw CSV:', csv); // 👈 Add this line
+  
   const lines = csv.split('\n').slice(1); // skip header row
 
   for (const line of lines) {
