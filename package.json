@@ -4,7 +4,7 @@
   "type": "module",
   "dependencies": {
     "csvtojson": "^3.0.0",
-    "formdata-node": "^5.0.0",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "formdata-node": "^5.0.0"
   }
 }
