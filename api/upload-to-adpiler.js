@@ -86,7 +86,7 @@ export default async function handler(req, res) {
 
     console.log('⬆️ Uploading to AdPiler:', uploadPayload);
 
-    const adpilerResp = await fetch('https://app.adpiler.com/api/v1/ads/upload', {
+    const adpilerResp = await fetch('https://api.adpiler.com/v1/upload-files', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
