@@ -86,14 +86,21 @@ export default async function handler(req, res) {
 
     console.log('⬆️ Uploading to AdPiler:', uploadPayload);
 
-    const adpilerResp = await fetch('https://api.adpiler.com/v1/upload-files', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-KEY': process.env.ADPILER_API_KEY,
-      },
-      body: JSON.stringify(uploadPayload),
-    });
+    const response = await fetch('https://api.adpiler.com/v1/upload-files', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'X-API-KEY': process.env.ADPILER_API_KEY
+  },
+  body: JSON.stringify({
+    client_id,
+    folder,
+    files,
+    notes,
+    build_link,
+    card_url
+  })
+});
 
     const adpilerResult = await adpilerResp.json();
     console.log('✅ Upload to AdPiler successful!', adpilerResult);
