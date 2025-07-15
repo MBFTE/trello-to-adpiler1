@@ -1,5 +1,10 @@
-import { json } from 'micro';
 import fetch from 'node-fetch';
+
+export const config = {
+  api: {
+    bodyParser: true,
+  },
+};
 
 const CLIENT_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSlL2KhvYcVnG2AUkT1DtFu9hGRfbYvT1B5wePkmglr1cVeK8EjUySRIgqE3FEsGw/pub?gid=0&single=true&output=csv';
 
@@ -8,7 +13,7 @@ let clientIdMap = {};
 async function fetchClientIds() {
   const res = await fetch(CLIENT_CSV_URL);
   const csv = await res.text();
-  const lines = csv.split('\n').slice(1); // skip header
+  const lines = csv.split('\n').slice(1);
   for (const line of lines) {
     const [client, id] = line.split(',').map(s => s.trim().toLowerCase());
     if (client && id) clientIdMap[client] = id;
@@ -20,7 +25,7 @@ export default async function handler(req, res) {
     return res.status(405).send('Method not allowed');
   }
 
-  const body = await json(req);
+  const body = req.body;
   console.log('📩 Webhook received from Trello');
   console.log('📨 Request Body:', JSON.stringify(body, null, 2));
 
@@ -95,4 +100,3 @@ export default async function handler(req, res) {
 
   res.status(200).send('Upload successful.');
 }
-
