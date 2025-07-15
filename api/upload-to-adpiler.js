@@ -1,6 +1,11 @@
 export default async function handler(req, res) {
+  if (req.method === 'HEAD') {
+    // Trello sends HEAD to verify the webhook
+    return res.status(200).end();
+  }
+
   if (req.method === 'GET') {
-    // Trello sends a GET request to verify the webhook
+    // Optional: sometimes Trello also sends a GET
     return res.status(200).send('Webhook verified');
   }
 
@@ -8,10 +13,11 @@ export default async function handler(req, res) {
     console.log('📩 Webhook received from Trello');
     console.log('Request Body:', JSON.stringify(req.body, null, 2));
 
-    // Optional: respond with a success message
+    // You can put your real webhook logic here later
+
     return res.status(200).send('Webhook processed');
   }
 
-  // If it's neither GET nor POST, reject it
+  // Any other method gets blocked
   res.status(405).send('Method Not Allowed');
 }
