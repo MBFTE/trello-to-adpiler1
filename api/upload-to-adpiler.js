@@ -17,7 +17,6 @@ module.exports = async (req, res) => {
     console.log('📝 Card title:', cardTitle);
     console.log('👤 Client from card title:', clientName);
 
-    // Fetch Google Sheet CSV
     const response = await fetch(GOOGLE_SHEET_CSV_URL);
     const rawCSV = await response.text();
     console.log('📄 Raw CSV:', rawCSV);
@@ -41,7 +40,7 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: 'No matching client ID' });
     }
 
-    // Here you'd call the AdPiler API — this is just a placeholder
+    // Placeholder for AdPiler API
     console.log('🚀 Pretending to send creative to AdPiler...');
 
     return res.status(200).json({ success: true, clientId });
