@@ -1,6 +1,6 @@
 import fetch from 'node-fetch';
 
-const CLIENT_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSlL2KhvYcVnG2AUkT1DtFu9hGRfbYvT1B5wePkmglr1cVeK8EjUySRIgqE3FEsGw/pub?gid=0&single=true&output=csv';
+const CLIENT_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pubhtml';
 
 let clientIdMap = {};
 
