@@ -1,114 +1,97 @@
-import csv from 'csvtojson';
+import { json } from 'micro';
+import fetch from 'node-fetch';
 
-const SHEET_CSV_URL = 'https://docs.google.com/spreadsheets/d/1c1V-8rdHtn3sWihB0cWRgPG3OhuqjtpymzjdguEsvs4/export?format=csv';
+const CLIENT_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSlL2KhvYcVnG2AUkT1DtFu9hGRfbYvT1B5wePkmglr1cVeK8EjUySRIgqE3FEsGw/pub?gid=0&single=true&output=csv';
 
-export const config = {
-  api: {
-    bodyParser: false,
-  },
-};
+let clientIdMap = {};
 
-// Parse raw body as buffer
-async function getRawBody(req) {
-  return new Promise((resolve, reject) => {
-    let data = [];
-    req
-      .on('data', chunk => data.push(chunk))
-      .on('end', () => resolve(Buffer.concat(data).toString()))
-      .on('error', reject);
-  });
+async function fetchClientIds() {
+  const res = await fetch(CLIENT_CSV_URL);
+  const csv = await res.text();
+  const lines = csv.split('\n').slice(1); // skip header
+  for (const line of lines) {
+    const [client, id] = line.split(',').map(s => s.trim().toLowerCase());
+    if (client && id) clientIdMap[client] = id;
+  }
 }
 
 export default async function handler(req, res) {
-  if (req.method === 'HEAD') return res.status(200).end();
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+  if (req.method !== 'POST') {
+    return res.status(405).send('Method not allowed');
+  }
 
-  try {
-    console.log('📩 Webhook received from Trello');
-    const rawBody = await getRawBody(req);
-    const webhookPayload = JSON.parse(rawBody);
-    console.log('📨 Request Body:', webhookPayload);
+  const body = await json(req);
+  console.log('📩 Webhook received from Trello');
+  console.log('📨 Request Body:', JSON.stringify(body, null, 2));
 
-    const action = webhookPayload?.action;
-    const listName = action?.data?.listAfter?.name;
-    if (listName !== 'Ready for AdPiler') {
-      console.log('🚫 Card not moved to Ready for AdPiler — skipping');
-      return res.status(200).json({ message: 'Not a Ready for AdPiler event' });
-    }
+  const action = body?.action;
+  const listName = action?.data?.listAfter?.name;
+  const cardId = action?.data?.card?.id;
+  const cardTitle = action?.data?.card?.name || '';
 
-    const cardId = action?.data?.card?.id;
-    const cardTitle = action?.data?.card?.name;
-    console.log('📌 List moved to:', listName);
-    console.log('🪪 Card ID:', cardId);
-    console.log('📝 Card title:', cardTitle);
+  if (listName !== 'Ready for AdPiler') {
+    return res.status(200).send('Not the right list. Ignoring.');
+  }
 
-    const clientName = (cardTitle.split(':')[0] || '').trim().toLowerCase();
-    console.log('👤 Client from card title:', clientName);
+  console.log('📌 List moved to:', listName);
+  console.log('🪪 Card ID:', cardId);
+  console.log('📝 Card title:', cardTitle);
 
-    const response = await fetch(SHEET_CSV_URL);
-    const csvText = await response.text();
-    const rows = await csv().fromString(csvText);
+  const clientName = cardTitle.split(':')[0]?.trim().toLowerCase();
+  console.log('👤 Client from card title:', clientName);
 
-    const clientMatch = rows.find((row) => {
-      const name = row['Trello Client Name'];
-      return name && name.toLowerCase().includes(clientName);
-    });
+  if (Object.keys(clientIdMap).length === 0) {
+    await fetchClientIds();
+  }
 
-    if (!clientMatch) {
-      console.error('❌ No match found in CSV for client:', clientName);
-      return res.status(200).json({ error: 'Client match not found in CSV' });
-    }
+  const clientId = clientIdMap[clientName];
+  console.log('✅ Matched client ID:', clientId);
 
-    const adpilerClientId = clientMatch['AdPiler Client ID'];
-    console.log('✅ Matched client ID:', adpilerClientId);
+  if (!clientId) {
+    console.error('❌ No matching client ID found.');
+    return res.status(400).send('Client ID not found.');
+  }
 
-    const cardResp = await fetch(`https://api.trello.com/1/cards/${cardId}?attachments=true&customFieldItems=true&checklists=all&fields=all&key=${process.env.TRELLO_API_KEY}&token=${process.env.TRELLO_TOKEN}`);
-    const card = await cardResp.json();
-    console.log('📎 Full card response from Trello:', card);
+  const trelloCardResp = await fetch(`https://api.trello.com/1/cards/${cardId}?attachments=true&fields=desc,url,name&key=${process.env.TRELLO_API_KEY}&token=${process.env.TRELLO_TOKEN}`);
+  const card = await trelloCardResp.json();
+  console.log('📎 Full card response from Trello:', card);
 
-    const attachments = card.attachments?.filter(att => att.isUpload) || [];
-    const adAssets = attachments.map(att => ({
-      fileUrl: att.url,
-      fileName: att.name,
-    }));
+  const folderMatch = card.desc.match(/\*\*Folder:\s*(.+?)\*\*/);
+  const folder = folderMatch ? folderMatch[1].trim() : 'Uncategorized';
+  const notes = card.desc || '';
 
-    const buildBoxLink = (card.desc.match(/\*\*Final Build Box Link:\*\*\s*\n\n(.*)/) || [])[1] || '';
-    const folderMatch = (card.desc.match(/\*\*Folder:\s*(.*?)\*\*/) || [])[1] || '';
+  const files = (card.attachments || []).map(file => ({
+    fileUrl: file.url,
+    fileName: file.name
+  }));
 
-    const uploadPayload = {
-      client_id: adpilerClientId,
-      folder: folderMatch || 'Unknown Folder',
-      files: adAssets,
-      notes: card.desc,
-      build_link: buildBoxLink,
-      card_url: card.url,
-    };
-
-    console.log('⬆️ Uploading to AdPiler:', uploadPayload);
-
-    const response = await fetch('https://api.adpiler.com/v1/upload-files', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-    'X-API-KEY': process.env.ADPILER_API_KEY
-  },
-  body: JSON.stringify({
-    client_id,
+  const payload = {
+    client_id: clientId,
     folder,
     files,
     notes,
-    build_link,
-    card_url
-  })
-});
+    build_link: '---',
+    card_url: card.shortUrl
+  };
 
-    const adpilerResult = await adpilerResp.json();
-    console.log('✅ Upload to AdPiler successful!', adpilerResult);
+  console.log('⬆️ Uploading to AdPiler:', payload);
 
-    return res.status(200).json({ success: true, result: adpilerResult });
+  const adpilerUpload = await fetch('https://api.adpiler.com/v1/upload-files', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-API-KEY': process.env.ADPILER_API_KEY
+    },
+    body: JSON.stringify(payload)
+  });
 
-  } catch (err) {
-    console.error('❌ Upload handler error:', err);
-    return res.status(500).json({ error: 'Something went wrong', details: err.message });
+  const uploadResult = await adpilerUpload.json();
+  console.log('✅ AdPiler Upload Result:', uploadResult);
+
+  if (!adpilerUpload.ok) {
+    console.error('❌ Upload to AdPiler failed:', uploadResult);
+    return res.status(500).send('AdPiler upload failed.');
   }
+
+  res.status(200).send('Upload successful.');
 }
