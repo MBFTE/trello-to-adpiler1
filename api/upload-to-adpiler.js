@@ -1,23 +1,22 @@
 export const config = {
-  api: {
-    bodyParser: false,
-  },
+  runtime: 'edge',
 };
 
-// ✅ CORRECT published Google Sheet CSV link
-const CLIENT_CSV_URL =
-  'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
+const ADPILER_API_KEY = '11|8u3W1oxoMT0xYCGa91Q7HjznUYfEqODrhVShcXCj';
+const CLIENT_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
 
 let clientIdMap = {};
 
 async function fetchClientIds() {
   const res = await fetch(CLIENT_CSV_URL);
   const csv = await res.text();
-  const lines = csv.split('\n').slice(1); // Skip header
+  console.log('📄 Raw CSV:', csv);
+
+  const lines = csv.split('\n').slice(1); // skip header row
 
   for (const line of lines) {
     const [clientRaw, idRaw] = line.split(',');
-    const client = clientRaw?.trim(); // ✅ Preserve original case
+    const client = clientRaw?.trim(); // no lowercasing!
     const id = idRaw?.trim();
     if (client && id) {
       clientIdMap[client] = id;
@@ -27,58 +26,62 @@ async function fetchClientIds() {
   console.log('🧾 Client Map:', clientIdMap);
 }
 
-function extractClientName(cardTitle) {
-  return cardTitle.split(':')[0]?.trim(); // "Zia Clovis" from "Zia Clovis: Carousel Ad"
-}
+export default async function handler(req) {
+  console.log('📩 Webhook received from Trello');
+  const body = await req.json();
+  console.log('📨 Request Body:', body);
 
-function findClientId(caseInsensitiveName) {
-  for (const clientName in clientIdMap) {
-    if (clientName.toLowerCase() === caseInsensitiveName.toLowerCase()) {
-      return clientIdMap[clientName]; // Return ID using original-cased key
-    }
-  }
-  return undefined;
-}
+  const listName = body?.action?.data?.listAfter?.name || '';
+  console.log('📌 List moved to:', listName);
 
-export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).send('Method Not Allowed');
+  if (listName !== 'Ready for AdPiler') {
+    return new Response('Not Ready for AdPiler list. Ignored.', { status: 200 });
   }
 
-  let body = '';
-  req.on('data', chunk => {
-    body += chunk;
+  const card = body?.action?.data?.card;
+  const cardTitle = card?.name || '';
+  const cardId = card?.id || '';
+  const clientFromTitle = cardTitle.split(':')[0].trim();
+  console.log('🪪 Card ID:', cardId);
+  console.log('📝 Card title:', cardTitle);
+  console.log('👤 Client from card title:', clientFromTitle);
+
+  await fetchClientIds();
+
+  const clientId = clientIdMap[clientFromTitle];
+  console.log('✅ Matched client ID:', clientId);
+
+  if (!clientId) {
+    console.error('❌ No matching client ID found.');
+    return new Response('Client ID not found', { status: 400 });
+  }
+
+  // 🔥 Upload placeholder creative to AdPiler
+  const uploadResponse = await fetch('https://app.adpiler.com/api/creatives', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${ADPILER_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      client_id: clientId,
+      name: cardTitle,
+      type: 'other',
+      platform: 'facebook',
+      tags: ['auto-uploaded'],
+      notes: `Uploaded from Trello card: ${cardTitle}`,
+      url: `https://trello.com/c/${card.shortLink}`
+    })
   });
 
-  req.on('end', async () => {
-    const payload = JSON.parse(body);
+  const uploadResult = await uploadResponse.json();
 
-    console.log('📩 Webhook received from Trello');
-    console.log('📨 Request Body:', payload);
-
-    const listName = payload.action?.data?.listAfter?.name;
-    const cardId = payload.action?.data?.card?.id;
-    const cardTitle = payload.action?.data?.card?.name;
-
-    console.log('📌 List moved to:', listName);
-    console.log('🪪 Card ID:', cardId);
-    console.log('📝 Card title:', cardTitle);
-
-    const clientFromCard = extractClientName(cardTitle);
-    console.log('👤 Client from card title:', clientFromCard);
-
-    await fetchClientIds();
-
-    const clientId = findClientId(clientFromCard);
-    console.log('✅ Matched client ID:', clientId);
-
-    if (!clientId) {
-      console.error('❌ No matching client ID found.');
-      return res.status(400).send('Client ID not found');
-    }
-
-    // 🔜 Insert AdPiler API logic here if desired
-
-    return res.status(200).send('Webhook processed successfully');
-  });
+  if (uploadResponse.ok) {
+    console.log('🚀 Upload to AdPiler successful!', uploadResult);
+    return new Response('Upload successful', { status: 200 });
+  } else {
+    console.error('💥 Upload failed', uploadResult);
+    return new Response('Upload failed', { status: 500 });
+  }
 }
+
