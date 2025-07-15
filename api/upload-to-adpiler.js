@@ -1,77 +1,95 @@
 import fetch from 'node-fetch';
+import { FormData } from 'formdata-node';
+import csv from 'csvtojson';
+import https from 'https';
 
-const CLIENT_CSV_URL =
+export const config = {
+  runtime: 'edge',
+};
+
+const GOOGLE_SHEET_CSV_URL =
   'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
 
-const clientIdMap = {};
+const READY_FOR_ADPILER_LIST_ID = '6202db0c0f425434fbc9864b';
+const ADPILER_API_KEY = '11|8u3W1oxoMT0xYCGa91Q7HjznUYfEqODrhVShcXCj';
 
-async function fetchClientIds() {
-  const res = await fetch(CLIENT_CSV_URL);
-  const csv = await res.text();
-  console.info('📄 Raw CSV:', csv);
+const httpsAgent = new https.Agent({
+  rejectUnauthorized: false, // only for dev; DO NOT use in production
+});
 
-  const lines = csv.split('\n').slice(1); // skip header
-  for (const line of lines) {
-    const [clientRaw, idRaw] = line.split(',');
-    const client = clientRaw?.trim();
-    const id = idRaw?.trim();
-    if (client && id) {
-      clientIdMap[client] = id;
-    }
+export default async function handler(req) {
+  console.info('📩 Webhook received from Trello');
+
+  const body = await req.json();
+  console.info('📨 Request Body:', body);
+
+  const { action } = body;
+  const listAfterId = action?.data?.listAfter?.id;
+  const cardId = action?.data?.card?.id;
+  const cardTitle = action?.data?.card?.name;
+
+  console.info('📌 List moved to:', action?.data?.listAfter?.name);
+  console.info('🪪 Card ID:', cardId);
+  console.info('📝 Card title:', cardTitle);
+
+  // Only continue if card moved to the Ready for AdPiler list
+  if (listAfterId !== READY_FOR_ADPILER_LIST_ID) {
+    return new Response('✅ Ignored – not moved to Ready for AdPiler', { status: 200 });
   }
 
-  console.info('🧾 Client Map:', clientIdMap);
-}
+  // Extract client name from Trello card title (before the colon)
+  const clientName = cardTitle.split(':')[0].trim();
+  console.info('👤 Client from card title:', clientName);
 
-export default async function handler(req, res) {
+  // Load the Google Sheet to map client name to AdPiler ID
+  let clientMap = {};
   try {
-    console.info('📩 Webhook received from Trello');
-    console.info('📨 Request Body:', req.body);
+    const csvRes = await fetch(GOOGLE_SHEET_CSV_URL);
+    const rawCSV = await csvRes.text();
+    console.info('📄 Raw CSV:', rawCSV);
 
-    const cardName = req.body?.action?.data?.card?.name;
-    const cardId = req.body?.action?.data?.card?.id;
-    const listName = req.body?.action?.data?.listAfter?.name;
+    const records = await csv().fromString(rawCSV);
+    clientMap = records.reduce((acc, row) => {
+      acc[row['Trello Client Name']] = row['Adpiler Client ID'];
+      return acc;
+    }, {});
+    console.info('🧾 Client Map:', clientMap);
+  } catch (err) {
+    console.error('🚨 Failed to load client map:', err);
+    return new Response('Failed to load client mapping CSV', { status: 500 });
+  }
 
-    console.info('📌 List moved to:', listName);
-    console.info('🪪 Card ID:', cardId);
-    console.info('📝 Card title:', cardName);
+  const clientId = clientMap[clientName];
+  console.info('✅ Matched client ID:', clientId);
 
-    const clientName = cardName.split(':')[0]?.trim();
-    console.info('👤 Client from card title:', clientName);
+  if (!clientId) {
+    console.error('❌ No matching client ID found.');
+    return new Response('Client ID not found', { status: 404 });
+  }
 
-    await fetchClientIds();
-    const clientId = clientIdMap[clientName];
-    console.info('✅ Matched client ID:', clientId);
+  // Example payload to AdPiler (you’ll need to adjust based on their actual API docs)
+  const formData = new FormData();
+  formData.set('api_key', ADPILER_API_KEY);
+  formData.set('client_id', clientId);
+  formData.set('title', cardTitle);
 
-    if (!clientId) {
-      throw new Error('No matching client ID found.');
-    }
-
-    // Upload to AdPiler
+  try {
     const adpilerRes = await fetch('https://api.adpiler.com/v1/add-creative', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-KEY': '11|8u3W1oxoMT0xYCGa91Q7HjznUYfEqODrhVShcXCj'
-      },
-      body: JSON.stringify({
-        client_id: clientId,
-        name: cardName,
-        external_id: cardId
-      })
+      body: formData,
+      agent: httpsAgent,
     });
 
-    const adpilerData = await adpilerRes.json();
-
-    console.info('🚀 AdPiler response:', adpilerData);
+    const result = await adpilerRes.text();
 
     if (!adpilerRes.ok) {
-      throw new Error(adpilerData?.message || 'Upload to AdPiler failed');
+      throw new Error(result);
     }
 
-    res.status(200).json({ message: 'Upload successful', data: adpilerData });
+    console.info('🎉 AdPiler upload successful:', result);
+    return new Response('Uploaded to AdPiler successfully', { status: 200 });
   } catch (err) {
     console.error('🔥 Fatal error:', err);
-    res.status(500).json({ error: err.message || 'internal error' });
+    return new Response('AdPiler upload failed', { status: 500 });
   }
 }
