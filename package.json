@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "dependencies": {
-    "csvtojson": "^3.0.0",
+    "csvtojson": "^2.0.10",
     "node-fetch": "^3.3.2",
     "formdata-node": "^5.0.0"
   }
