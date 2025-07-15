@@ -1,9 +1,10 @@
 {
-  "name": "trello-to-adpiler1",
+  "name": "trello-to-adpiler",
   "version": "1.0.0",
   "type": "module",
   "dependencies": {
-    "csv-parse": "^5.5.0",
+    "csvtojson": "^3.0.0",
+    "formdata-node": "^5.0.0",
     "node-fetch": "^3.3.2"
   }
 }
