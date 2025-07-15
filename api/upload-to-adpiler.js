@@ -13,12 +13,13 @@ let clientIdMap = {};
 async function fetchClientIds() {
   const res = await fetch(CLIENT_CSV_URL);
   const csv = await res.text();
-  const lines = csv.split('\n').slice(1);
+  const lines = csv.split('\n').slice(1); // skip header
   for (const line of lines) {
     const [client, id] = line.split(',').map(s => s.trim().toLowerCase());
     if (client && id) clientIdMap[client] = id;
   }
 }
+
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
