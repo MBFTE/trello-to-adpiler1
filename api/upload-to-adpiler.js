@@ -2,6 +2,12 @@ import fetch from 'node-fetch';
 import { FormData } from 'formdata-node';
 import csv from 'csvtojson';
 
+// Force Vercel to use Node.js Serverless function runtime
+export const config = {
+  runtime: 'nodejs18.x'
+};
+
+
 const CLIENT_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
 const ADPILER_API = 'https://api.adpiler.com/v1/add-creative';
 const ADPILER_API_KEY = '11|8u3W1oxoMT0xYCGa91Q7HjznUYfEqODrhVShcXCj';
