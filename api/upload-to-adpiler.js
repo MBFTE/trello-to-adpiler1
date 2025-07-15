@@ -76,7 +76,15 @@ export default async function handler(req) {
       })
     });
 
-    const uploadResult = await uploadResponse.json().catch(() => ({}));
+    let uploadResult;
+try {
+  uploadResult = await uploadResponse.json();
+} catch (e) {
+  const errorText = await uploadResponse.text();
+  console.error('❗ AdPiler non-JSON response:', errorText);
+  throw new Error('AdPiler returned non-JSON response');
+}
+
 
     if (uploadResponse.ok) {
       console.log('🚀 Upload to AdPiler successful!', uploadResult);
