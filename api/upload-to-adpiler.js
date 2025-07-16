@@ -1,5 +1,6 @@
 import express from 'express';
 import fetch from 'node-fetch';
+import FormData from 'form-data';
 import { createRequire } from 'module';
 import sizeOf from 'image-size';
 import fileType from 'file-type';
@@ -67,7 +68,17 @@ const uploadToAdpiler = async (card, clientId, attachments) => {
     await downloadFile(attachment.url, filename);
 
     const buffer = fs.readFileSync(filename);
-    const dimensions = ext === '.mp4' ? { width: 1200, height: 1200 } : sizeOf(buffer);
+    let dimensions = { width: 0, height: 0 };
+    if (ext !== '.mp4') {
+      try {
+        dimensions = sizeOf(buffer);
+      } catch (e) {
+        fs.unlinkSync(filename);
+        continue;
+      }
+    } else {
+      dimensions = { width: 1200, height: 1200 }; // Assume MP4s are 1:1
+    }
 
     const validSizes = [
       { width: 1200, height: 1200 },
@@ -81,7 +92,7 @@ const uploadToAdpiler = async (card, clientId, attachments) => {
     }
 
     const type = await fileType.fromBuffer(buffer);
-    formData.append('files[]', buffer, { filename, contentType: type?.mime });
+    formData.append('files[]', buffer, { filename, contentType: type?.mime || 'application/octet-stream' });
     fs.unlinkSync(filename);
   }
 
@@ -97,10 +108,17 @@ const uploadToAdpiler = async (card, clientId, attachments) => {
 };
 
 const addUploadedLabel = async (cardId) => {
-  const labelRes = await fetch(`https://api.trello.com/1/cards/${cardId}/labels?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`);
+  // Get board ID
+  const cardDataRes = await fetch(`https://api.trello.com/1/cards/${cardId}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`);
+  const cardData = await cardDataRes.json();
+  const boardId = cardData.idBoard;
+
+  // Get all labels on board
+  const labelRes = await fetch(`https://api.trello.com/1/boards/${boardId}/labels?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`);
   const labels = await labelRes.json();
   let labelId = labels.find(l => l.name === 'Uploaded')?.id;
 
+  // Create label if it doesn’t exist
   if (!labelId) {
     const createLabelRes = await fetch(`https://api.trello.com/1/labels?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`, {
       method: 'POST',
@@ -108,13 +126,14 @@ const addUploadedLabel = async (cardId) => {
       body: JSON.stringify({
         name: 'Uploaded',
         color: 'green',
-        idBoard: cardId
+        idBoard: boardId
       })
     });
     const newLabel = await createLabelRes.json();
     labelId = newLabel.id;
   }
 
+  // Attach label to card
   await fetch(`https://api.trello.com/1/cards/${cardId}/idLabels?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -152,3 +171,4 @@ app.post('/api/upload-to-adpiler', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ Server listening on port ${PORT}`);
 });
+
