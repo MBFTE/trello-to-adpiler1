@@ -1,7 +1,1 @@
-{
-  "functions": {
-    "api/upload-to-adpiler.js": {
-      "runtime": "nodejs18.x"
-    }
-  }
-}
+
