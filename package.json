@@ -1,10 +1,10 @@
 {
   "name": "trello-to-adpiler",
   "version": "1.0.0",
-  "type": "commonjs",
+  "type": "module",
   "dependencies": {
     "csvtojson": "^2.0.10",
-    "node-fetch": "^2.6.7"
+    "formdata-node": "^5.0.0",
+    "node-fetch": "^3.3.2"
   }
 }
-// redeploy trigger
