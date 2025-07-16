@@ -27,7 +27,7 @@ app.post('/api/upload-to-adpiler', async (req, res) => {
       const adpilerResponse = await fetch('https://api.adpiler.com/upload', {
         method: 'POST',
         headers: {
-          'Authorization': 'Bearer YOUR_ADPILER_TOKEN',
+          'Authorization': `Bearer ${process.env.ADPILER_TOKEN}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
