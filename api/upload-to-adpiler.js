@@ -1,6 +1,5 @@
 import express from 'express';
 import fetch from 'node-fetch';
-import { google } from 'googleapis';
 import { createRequire } from 'module';
 import sizeOf from 'image-size';
 import fileType from 'file-type';
