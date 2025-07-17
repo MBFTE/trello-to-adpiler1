@@ -144,7 +144,7 @@ app.post('/upload-to-adpiler', async (req, res) => {
 
     let uploadPath;
     if (format === 'social') {
-      uploadPath = `/v1/campaigns/${campaignId}/social-ads`; // ✅ corrected
+      uploadPath = `/campaigns/${campaignId}/social-ads`; // ✅ corrected
       form.append('name',       cardName);
       form.append('network',    fieldMap['network']    || 'facebook');
       form.append('type',       fieldMap['type']       || 'post');
@@ -152,7 +152,7 @@ app.post('/upload-to-adpiler', async (req, res) => {
       const logo = buffers.find(b => b !== null);
       if (logo) form.append('logo', logo.buf, logo.name);
     } else {
-      uploadPath = `/v1/campaigns/${campaignId}/ads`; // ✅ corrected
+      uploadPath = `/campaigns/${campaignId}/ads`; // ✅ corrected
       form.append('name',              cardName);
       form.append('width',             fieldMap['width']       || '300');
       form.append('height',            fieldMap['height']      || '250');
