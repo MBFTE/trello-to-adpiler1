@@ -1,107 +1,109 @@
-// api/upload-to-adpiler.js
 import express from 'express';
 import fetch from 'node-fetch';
-import FormData from 'form-data';
-import { fromBuffer } from 'file-type';
 import csv from 'csvtojson';
+import FormData from 'form-data';
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const CSV_URL = 'https://docs.google.com/spreadsheets/d/e/…/pub?output=csv';
-const ADPILER_TOKEN = process.env.ADPILER_API_KEY;       // set in your Render/Env
-const TRELLO_TOKEN  = process.env.TRELLO_TOKEN;         // set in your Render/Env
+const CLIENT_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
+const ADPILER_API_KEY = process.env.ADPILER_API_KEY || '11|8u3W1oxoMT0xYCGa91Q7HjznUYfEqODrhVShcXCj';
 
-// map of Trello‑prefix → Adpiler client ID
-let clientMap = {};
+// In-memory maps
+const clientMap = {};
+const folderMap = {};
 
-// load CSV once at startup
-async function loadClientMap() {
-  const res = await fetch(CSV_URL);
-  if (!res.ok) throw new Error(`Failed to fetch CSV (${res.status})`);
-  const text = await res.text();
-  const rows = await csv().fromString(text);
+// Fetch and parse CSV for client & folder mappings
+async function fetchMappings() {
+  const res = await fetch(CLIENT_CSV_URL);
+  if (!res.ok) throw new Error(`Failed to fetch CSV: ${res.status}`);
+  const raw = await res.text();
+  const rows = await csv().fromString(raw);
+
   rows.forEach(r => {
-    const key = r['Trello Client Name']?.trim();
-    const id  = r['Adpiler Client ID']?.trim();
-    if (key && id) clientMap[key] = id;
+    const clientName = r['Trello Client Name']?.trim();
+    const clientId   = r['Adpiler Client ID']?.trim();
+    const listName   = r['Trello List Name']?.trim();
+    const folderId   = r['Adpiler Folder ID']?.trim();
+
+    if (clientName && clientId) {
+      clientMap[clientName] = clientId;
+    }
+    if (clientName && listName && folderId) {
+      folderMap[`${clientName}|${listName}`] = folderId;
+    }
   });
-  console.log('▶️  clientMap loaded:', clientMap);
 }
-await loadClientMap();
 
-// map your Trello list names → numeric Adpiler campaign IDs
-const CAMPAIGN_MAP = {
-  Clovis:  /* e.g. */ process.env.CAMPAIGN_CLOVIS_ID,
-  Roswell: process.env.CAMPAIGN_ROSWELL_ID,
-  // add more as needed…
-};
-
-// download a Trello attachment buffer
-async function downloadAttachment(url) {
-  const r = await fetch(url, { headers: { Authorization: `Bearer ${TRELLO_TOKEN}` } });
-  if (!r.ok) throw new Error(`Download failed ${r.status}`);
-  return r.buffer();
-}
+// Initialize mappings
+await fetchMappings();
 
 app.post('/upload-to-adpiler', async (req, res) => {
   try {
-    const act = req.body.action?.data;
-    const card = act?.card;
-    const list = act?.list;
-    if (!card || !list) return res.status(400).json({ error: 'Invalid Trello webhook payload' });
+    const card   = req.body.action?.data?.card;
+    const list   = req.body.action?.data?.list;
+    if (!card || !list) return res.status(400).send('Missing card or list data');
 
-    // extract the prefix before the colon
-    const rawPrefix = card.name.split(':')[0].trim();
-    // find a CSV key that rawPrefix *contains*
-    const clientKey = Object.keys(clientMap).find(k => rawPrefix.includes(k));
-    if (!clientKey) throw new Error(`No Adpiler client found for "${rawPrefix}"`);
-    const clientId = clientMap[clientKey];
+    const cardName = card.name;
+    const listName = list.name;
+    const clientName = cardName.split(':')[0].trim();
 
-    // lookup campaign ID by Trello list name
-    const campaignId = CAMPAIGN_MAP[list.name];
-    if (!campaignId) throw new Error(`No campaign ID mapped for list "${list.name}"`);
+    const clientId = clientMap[clientName];
+    const folderKey = `${clientName}|${listName}`;
+    const folderId  = folderMap[folderKey];
 
-    const atts = card.attachments || [];
-    if (!atts.length) throw new Error('No attachments on this Trello card');
+    if (!clientId) {
+      return res.status(404).send(`No Adpiler client for "${clientName}"`);
+    }
+    if (!folderId) {
+      return res.status(404).send(`No Adpiler folder for "${folderKey}"`);
+    }
 
-    for (const att of atts) {
-      const buf = await downloadAttachment(att.url);
-      const ft = await fromBuffer(buf);
-      if (!ft) throw new Error(`Unsupported file type for ${att.url}`);
+    const attachments = card.attachments || [];
+    for (const att of attachments) {
+      // Download Trello attachment
+      const fileRes = await fetch(att.url);
+      if (!fileRes.ok) {
+        console.error('Download failed', att.url, fileRes.status);
+        continue;
+      }
+      const buffer = await fileRes.buffer();
 
+      // Build multipart form-data
       const form = new FormData();
-      form.append('name', card.name);
-      form.append('client_id', clientId);
-      form.append('file', buf, {
-        filename: att.name,
-        contentType: ft.mime
-      });
+      form.append('name', cardName);
+      form.append('file', buffer, { filename: att.name || 'upload' });
+      // Upload parameters
+      form.append('campaign', folderId);
 
-      const apiRes = await fetch(
-        `https://platform.adpiler.com/api/campaigns/${campaignId}/ads`,
+      // Send to Adpiler
+      const uploadRes = await fetch(
+        `https://platform.adpiler.com/api/campaigns/${folderId}/ads`,
         {
           method: 'POST',
-          headers: {
-            Authorization: `Bearer ${ADPILER_TOKEN}`,
-            ...form.getHeaders()
-          },
-          body: form
+          headers: { 'X-API-KEY': ADPILER_API_KEY },
+          body: form,
         }
       );
-      if (!apiRes.ok) {
-        const txt = await apiRes.text();
-        throw new Error(`Adpiler upload failed ${apiRes.status}: ${txt}`);
+
+      if (!uploadRes.ok) {
+        const text = await uploadRes.text();
+        console.error('Adpiler upload failed', uploadRes.status, text);
       }
     }
 
-    return res.json({ success: true });
+    res.status(200).send('Upload job complete');
   } catch (err) {
-    console.error('❌ Upload error:', err);
-    return res.status(500).json({ error: err.message });
+    console.error('Upload error:', err);
+    res.status(500).send('Internal Server Error');
   }
 });
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server listening on port ${PORT}`);
+});
+
 
 app.listen(PORT, () => {
   console.log(`🚀 Listening on port ${PORT}`);
