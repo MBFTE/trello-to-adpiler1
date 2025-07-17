@@ -1,4 +1,4 @@
-// api/upload-to-adpiler.js (top of file)
+// api/upload-to-adpiler.js
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -18,47 +18,32 @@ const TRELLO_API_KEY   = process.env.TRELLO_API_KEY;
 const TRELLO_TOKEN     = process.env.TRELLO_TOKEN;
 const TRELLO_BOARD_ID  = process.env.TRELLO_BOARD_ID;
 const ADPILER_API_KEY  = process.env.ADPILER_API_KEY;
-
-// …rest of your code remains unchanged…
-
-
-const app = express();
-app.use(express.json());
+const ADPILER_BASE_URL =
+  process.env.ADPILER_BASE_URL || 'https://platform.adpiler.com/api';
 
 let clientMap = {};
 
-/**
- * Load mapping of Trello client names → Adpiler campaign IDs
- */
-async function refreshClientMap() {
+// Refresh client‐map at startup and every hour
+;(async function refreshClientMap() {
   try {
     console.log('🔄 Refreshing client map…');
     const res = await fetch(CLIENT_CSV_URL, { timeout: 15000 });
     if (!res.ok) throw new Error(`CSV fetch ${res.status}`);
-    const text = await res.text();
-    const rows = await csv().fromString(text);
-
-    const map = {};
-    for (const row of rows) {
+    const rows = await csv().fromString(await res.text());
+    clientMap = rows.reduce((map, row) => {
       const key = row['Trello Client Name']?.trim().toLowerCase();
       const id  = row['Adpiler Client ID']?.trim();
       if (key && id) map[key] = id;
-    }
-
-    clientMap = map;
-    console.log('✅ Loaded clients:', Object.keys(map).join(', '));
+      return map;
+    }, {});
+    console.log('✅ Loaded clients:', Object.keys(clientMap).join(', '));
   } catch (err) {
     console.error('❌ refreshClientMap error:', err.message);
   }
-}
+  setTimeout(refreshClientMap, 1000 * 60 * 60);
+})();
 
-// initialize and refresh hourly
-await refreshClientMap();
-setInterval(refreshClientMap, 1000 * 60 * 60);
-
-/**
- * Get all attachments metadata for a Trello card
- */
+// Trello helpers
 async function getCardAttachments(cardId) {
   const url = `https://api.trello.com/1/cards/${cardId}/attachments`
     + `?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
@@ -67,38 +52,27 @@ async function getCardAttachments(cardId) {
   return res.json();
 }
 
-/**
- * Download a Trello attachment (public URL then authenticated fallback)
- */
 async function downloadTrelloAttachment(cardId, att) {
   let res = await fetch(att.url, { redirect: 'follow', timeout: 15000 });
   if (!res.ok) {
-    const dl = `https://api.trello.com/1/cards/${cardId}`
-             + `/attachments/${att.id}/download`
-             + `?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
-    res = await fetch(dl, { redirect: 'follow', timeout: 15000 });
-    if (!res.ok) {
-      throw new Error(`download failed ${res.status}`);
-    }
+    const downloadUrl = `https://api.trello.com/1/cards/${cardId}`
+      + `/attachments/${att.id}/download`
+      + `?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
+    res = await fetch(downloadUrl, { redirect: 'follow', timeout: 15000 });
+    if (!res.ok) throw new Error(`download failed ${res.status}`);
   }
-  const buf = await res.arrayBuffer();
-  return Buffer.from(buf);
+  const arrayBuffer = await res.arrayBuffer();
+  return Buffer.from(arrayBuffer);
 }
 
-// health checks
+// Health checks
 app.head('/upload-to-adpiler', (_req, res) => res.sendStatus(200));
 app.get('/', (_req, res) => res.send('OK'));
 
-/**
- * Webhook: when a card is moved into TARGET_LIST_NAME,
- * fetch its details, parse ad copy, download attachments,
- * and upload everything to Adpiler.
- */
+// Webhook handler
 app.post('/upload-to-adpiler', async (req, res) => {
   try {
     const action = req.body.action;
-
-    // only handle moved-into-list events
     if (
       action?.type !== 'updateCard' ||
       action.data?.listAfter?.name !== TARGET_LIST_NAME
@@ -108,30 +82,23 @@ app.post('/upload-to-adpiler', async (req, res) => {
 
     const cardId = action.data.card.id;
 
-    // fetch full card info
+    // 1) Fetch card details
     const cardRes = await fetch(
-      `https://api.trello.com/1/cards/${cardId}`
-      + `?fields=name,desc,url`
-      + `&key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`
+      `https://api.trello.com/1/cards/${cardId}` +
+      `?fields=name,desc,url` +
+      `&key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`
     );
-    if (!cardRes.ok) {
-      throw new Error(`card fetch ${cardRes.status}`);
-    }
-    const cardInfo = await cardRes.json();
-    const cardName = cardInfo.name.trim();
+    if (!cardRes.ok) throw new Error(`card fetch ${cardRes.status}`);
+    const { name: cardName, desc, url: trelloUrl } = await cardRes.json();
 
-    // parse ad copy fields from card description
-    const lines = (cardInfo.desc || '')
-      .split('\n')
-      .map(l => l.trim())
-      .filter(Boolean);
-
-    const fieldMap = {};
-    for (const line of lines) {
-      const [rawKey, ...rest] = line.split(':');
-      if (!rawKey || rest.length === 0) continue;
-      fieldMap[rawKey.trim().toLowerCase()] = rest.join(':').trim();
-    }
+    // 2) Parse ad‐copy fields from description
+    const lines = (desc || '').split('\n').map(l => l.trim()).filter(Boolean);
+    const fieldMap = lines.reduce((m, line) => {
+      const [rawKey, ...vals] = line.split(':');
+      if (!rawKey || !vals.length) return m;
+      m[rawKey.trim().toLowerCase()] = vals.join(':').trim();
+      return m;
+    }, {});
 
     const primaryText     = fieldMap['primary text']      || '';
     const headline        = fieldMap['headline']          || '';
@@ -139,7 +106,7 @@ app.post('/upload-to-adpiler', async (req, res) => {
     const callToAction    = fieldMap['call to action']    || '';
     const clickUrl        = fieldMap['click through url'] || '';
 
-    // map Trello client → Adpiler campaign ID
+    // 3) Map to Adpiler campaign ID
     const clientKey  = cardName.split(':')[0].trim().toLowerCase();
     const campaignId = clientMap[clientKey];
     if (!campaignId) {
@@ -147,10 +114,10 @@ app.post('/upload-to-adpiler', async (req, res) => {
       return res.status(400).json({ error: `No campaign for ${clientKey}` });
     }
 
-    // fetch and download attachments
+    // 4) Fetch & download attachments
     const attachments = await getCardAttachments(cardId);
 
-    // build FormData
+    // 5) Build FormData payload
     const form = new FormData();
     form.append('primary_text',      primaryText);
     form.append('headline',          headline);
@@ -163,22 +130,22 @@ app.post('/upload-to-adpiler', async (req, res) => {
         const buf = await downloadTrelloAttachment(cardId, att);
         form.append('files[]', buf, att.name);
       } catch (err) {
-        console.error(`❌ download ${att.name} failed:`, err.message);
+        console.error(`❌ download "${att.name}" failed:`, err.message);
       }
     }
 
-    // upload to Adpiler
-    const apiRes = await fetch(
-      `https://api.adpiler.com/v1/campaigns/${campaignId}/ads`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${ADPILER_API_KEY}`,
-          ...form.getHeaders(),
-        },
-        body: form,
-      }
-    );
+    // 6) Upload to Adpiler
+    const uploadUrl = `${ADPILER_BASE_URL}/v1/campaigns/${campaignId}/ads`;
+    console.log(`➡️ Uploading to ${uploadUrl}`);
+    const apiRes = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${ADPILER_API_KEY}`,
+        ...form.getHeaders(),
+      },
+      body: form,
+      timeout: 20000,
+    });
 
     if (!apiRes.ok) {
       const body = await apiRes.text();
@@ -188,14 +155,13 @@ app.post('/upload-to-adpiler', async (req, res) => {
 
     console.log(`✅ Uploaded "${cardName}" to campaign ${campaignId}`);
     return res.sendStatus(200);
-
   } catch (err) {
     console.error('❌ Handler error:', err.message);
     return res.status(500).send('Internal server error');
   }
 });
 
+// Start server
 app.listen(PORT, () => {
   console.log(`🚀 Listening on port ${PORT}`);
 });
-
