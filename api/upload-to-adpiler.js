@@ -2,7 +2,7 @@ import express from 'express';
 import fetch from 'node-fetch';
 import { createRequire } from 'module';
 import sizeOf from 'image-size';
-import { fileTypeFromBuffer } from 'file-type';
+import * as fileType from 'file-type';
 import fs from 'fs';
 import https from 'https';
 import path from 'path';
@@ -68,26 +68,16 @@ const uploadToAdpiler = async (card, clientId, attachments) => {
     await downloadFile(attachment.url, filename);
 
     const buffer = fs.readFileSync(filename);
-    const type = await fileTypeFromBuffer(buffer);
 
-    // Skip if we can't detect MIME type
+    const type = await fileType.fromBuffer(buffer);
     if (!type || !type.mime) {
-      console.warn(`⚠️ Skipping file: Cannot detect MIME type for ${filename}`);
       fs.unlinkSync(filename);
       continue;
     }
 
-    // Get dimensions (skip for video)
-    let dimensions = { width: 1200, height: 1200 };
-    if (!type.mime.startsWith('video')) {
-      try {
-        dimensions = sizeOf(buffer);
-      } catch (err) {
-        console.warn(`⚠️ Skipping file: Cannot read dimensions for ${filename}`, err);
-        fs.unlinkSync(filename);
-        continue;
-      }
-    }
+    const dimensions = ext === '.mp4'
+      ? { width: 1200, height: 1200 }
+      : sizeOf(buffer);
 
     const validSizes = [
       { width: 1200, height: 1200 },
@@ -99,21 +89,22 @@ const uploadToAdpiler = async (card, clientId, attachments) => {
     );
 
     if (!isValidSize) {
-      console.warn(`⚠️ Skipping file: Invalid size ${dimensions.width}x${dimensions.height}`);
       fs.unlinkSync(filename);
       continue;
     }
 
-    // ✅ Add file to form
-    formData.append('files[]', buffer, { filename, contentType: type.mime });
+    formData.append('files[]', buffer, {
+      filename,
+      contentType: type.mime
+    });
+
     fs.unlinkSync(filename);
   }
 
   const res = await fetch('https://api.adpiler.com/v1/creatives', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${ADPILER_API_KEY}`,
-      ...formData.getHeaders()
+      Authorization: `Bearer ${ADPILER_API_KEY}`,
     },
     body: formData
   });
@@ -122,7 +113,11 @@ const uploadToAdpiler = async (card, clientId, attachments) => {
 };
 
 const addUploadedLabel = async (cardId) => {
-  const labelRes = await fetch(`https://api.trello.com/1/cards/${cardId}/labels?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`);
+  const cardRes = await fetch(`https://api.trello.com/1/cards/${cardId}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`);
+  const cardData = await cardRes.json();
+  const boardId = cardData.idBoard;
+
+  const labelRes = await fetch(`https://api.trello.com/1/boards/${boardId}/labels?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`);
   const labels = await labelRes.json();
   let labelId = labels.find(l => l.name === 'Uploaded')?.id;
 
@@ -133,7 +128,7 @@ const addUploadedLabel = async (cardId) => {
       body: JSON.stringify({
         name: 'Uploaded',
         color: 'green',
-        idBoard: cardId
+        idBoard: boardId
       })
     });
     const newLabel = await createLabelRes.json();
@@ -159,7 +154,9 @@ app.post('/api/upload-to-adpiler', async (req, res) => {
     const card = await cardRes.json();
 
     const clientMap = await getClientMap();
-    const matchedClient = Object.keys(clientMap).find(name => card.name.toLowerCase().includes(name.toLowerCase()));
+    const matchedClient = Object.keys(clientMap).find(name =>
+      card.name.toLowerCase().includes(name.toLowerCase())
+    );
     const clientId = matchedClient ? clientMap[matchedClient] : null;
 
     if (!clientId) return res.status(400).send('Client not matched');
