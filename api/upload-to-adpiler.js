@@ -1,21 +1,26 @@
-// upload-to-adpiler.js
+// api/upload-to-adpiler.js (top of file)
 
 import express from 'express';
 import fetch from 'node-fetch';
 import FormData from 'form-data';
 import csv from 'csvtojson';
-import dotenv from 'dotenv';
 
-dotenv.config();
+const app = express();
+app.use(express.json());
 
 const PORT             = process.env.PORT;
-const CLIENT_CSV_URL   = process.env.CLIENT_CSV_URL ||
+const CLIENT_CSV_URL   =
+  process.env.CLIENT_CSV_URL ||
   'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
+
 const TARGET_LIST_NAME = process.env.TARGET_LIST_NAME || 'READY FOR ADPILER';
 const TRELLO_API_KEY   = process.env.TRELLO_API_KEY;
 const TRELLO_TOKEN     = process.env.TRELLO_TOKEN;
 const TRELLO_BOARD_ID  = process.env.TRELLO_BOARD_ID;
 const ADPILER_API_KEY  = process.env.ADPILER_API_KEY;
+
+// …rest of your code remains unchanged…
+
 
 const app = express();
 app.use(express.json());
