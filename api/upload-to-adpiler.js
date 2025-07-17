@@ -6,7 +6,7 @@ import csv from 'csvtojson';
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT; // ✅ Use Render-assigned port only
 const CLIENT_CSV_URL =
   process.env.CLIENT_CSV_URL ||
   'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
@@ -171,7 +171,3 @@ app.listen(PORT, () => {
   console.log(`🚀 Listening on port ${PORT}`);
 });
 
-
-app.listen(PORT, () => {
-  console.log(`🚀 Listening on port ${PORT}`);
-});
