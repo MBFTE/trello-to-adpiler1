@@ -1,170 +1,158 @@
 import express from 'express';
 import fetch from 'node-fetch';
-import { createRequire } from 'module';
-import sizeOf from 'image-size';
-import * as fileType from 'file-type';
+import FormData from 'form-data';
 import fs from 'fs';
+import { fileTypeFromBuffer } from 'file-type';
+import sizeOf from 'image-size';
 import https from 'https';
 import path from 'path';
-import FormData from 'form-data';
+import { finished } from 'stream/promises';
 
-const require = createRequire(import.meta.url);
 const app = express();
+const PORT = 10000;
+
 app.use(express.json());
-const PORT = process.env.PORT || 10000;
 
-const ADPILER_API_KEY = process.env.ADPILER_API_KEY;
-const TRELLO_API_KEY = process.env.TRELLO_API_KEY;
+const ADPILER_TOKEN = process.env.ADPILER_TOKEN;
+const TRELLO_KEY = process.env.TRELLO_KEY;
 const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
-const SHEET_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
+const LABEL_NAME = 'Uploaded';
+const CLIENT_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
 
-const downloadFile = (url, dest) => {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(dest);
-    https.get(url, response => {
-      response.pipe(file);
-      file.on('finish', () => file.close(() => resolve(dest)));
-    }).on('error', reject);
-  });
+const downloadFile = async (url, dest) => {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Failed to download ${url}`);
+  const fileStream = fs.createWriteStream(dest);
+  await finished(response.body.pipe(fileStream));
 };
 
-const getClientMap = async () => {
-  const res = await fetch(SHEET_URL);
-  const csv = await res.text();
-  const rows = csv.split('\n').slice(1);
+const getClientMapping = async () => {
+  const res = await fetch(CLIENT_CSV_URL);
+  const text = await res.text();
+  const rows = text.trim().split('\n').slice(1); // Skip header
   const map = {};
-  rows.forEach(row => {
+  for (const row of rows) {
     const [clientName, clientId] = row.split(',');
-    if (clientName && clientId) {
-      map[clientName.trim()] = clientId.trim();
-    }
-  });
+    if (clientName && clientId) map[clientName.trim()] = clientId.trim();
+  }
   return map;
 };
 
-const uploadToAdpiler = async (card, clientId, attachments) => {
-  const formData = new FormData();
-  formData.append('client_id', clientId);
-  formData.append('headline', card.name || '');
-  formData.append('description', card.desc || '');
+const getOrCreateLabelId = async (boardId) => {
+  const labelRes = await fetch(`https://api.trello.com/1/boards/${boardId}/labels?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`);
+  const labels = await labelRes.json();
+  let label = labels.find(l => l.name === LABEL_NAME);
+  if (!label) {
+    const createRes = await fetch(`https://api.trello.com/1/labels?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: LABEL_NAME, color: 'green', idBoard: boardId }),
+    });
+    label = await createRes.json();
+  }
+  return label.id;
+};
 
-  const fields = {};
-  (card.desc || '').split('\n').forEach(line => {
-    const [key, ...rest] = line.split(':');
-    if (key && rest.length) {
-      fields[key.trim().toLowerCase()] = rest.join(':').trim();
-    }
-  });
+const uploadToAdpiler = async (card) => {
+  const mapping = await getClientMapping();
+  const clientId = mapping[card.name];
+  if (!clientId) throw new Error(`No AdPiler client found for "${card.name}"`);
 
-  formData.append('primary_text', fields['primary text'] || '');
-  formData.append('cta', fields['cta'] || '');
-  formData.append('click_through_url', fields['click through url'] || '');
+  const attachmentRes = await fetch(`https://api.trello.com/1/cards/${card.id}/attachments?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`);
+  const attachments = await attachmentRes.json();
+
+  const form = new FormData();
+  form.append('client', clientId);
+
+  const fields = {
+    headline: '',
+    description: '',
+    primaryText: '',
+    cta: '',
+    clickThroughUrl: ''
+  };
+
+  const cardRes = await fetch(`https://api.trello.com/1/cards/${card.id}?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`);
+  const cardData = await cardRes.json();
+  const fieldsFromDesc = cardData.desc.match(/(Headline|Description|Primary Text|CTA|Click Through URL):(.+)/gi);
+
+  if (fieldsFromDesc) {
+    fieldsFromDesc.forEach(line => {
+      const [key, ...rest] = line.split(':');
+      const value = rest.join(':').trim();
+      switch (key.trim().toLowerCase()) {
+        case 'headline': fields.headline = value; break;
+        case 'description': fields.description = value; break;
+        case 'primary text': fields.primaryText = value; break;
+        case 'cta': fields.cta = value; break;
+        case 'click through url': fields.clickThroughUrl = value; break;
+      }
+    });
+  }
+
+  form.append('headline', fields.headline);
+  form.append('description', fields.description);
+  form.append('caption', fields.primaryText);
+  form.append('cta', fields.cta);
+  form.append('url', fields.clickThroughUrl);
 
   for (const attachment of attachments) {
-    const ext = path.extname(attachment.url).toLowerCase();
-    if (!['.png', '.jpg', '.jpeg', '.gif', '.mp4'].includes(ext)) continue;
-
-    const filename = `temp_${Date.now()}${ext}`;
-    await downloadFile(attachment.url, filename);
+    const url = attachment.url;
+    const ext = path.extname(url).split('?')[0];
+    const filename = `tmp_${Date.now()}${ext}`;
+    await downloadFile(url, filename);
 
     const buffer = fs.readFileSync(filename);
-
-    const type = await fileType.fromBuffer(buffer);
+    const type = await fileTypeFromBuffer(buffer);
     if (!type || !type.mime) {
       fs.unlinkSync(filename);
       continue;
     }
 
-    const dimensions = ext === '.mp4'
-      ? { width: 1200, height: 1200 }
-      : sizeOf(buffer);
+    const { width, height } = sizeOf(buffer);
+    const isSocial = width === 1200 && height === 1200;
+    const isDisplay = width === 300 && height === 600;
+    const isAllowed = ['image/png', 'image/jpeg', 'image/gif', 'video/mp4'].includes(type.mime);
 
-    const validSizes = [
-      { width: 1200, height: 1200 },
-      { width: 300, height: 600 }
-    ];
-
-    const isValidSize = validSizes.some(
-      s => s.width === dimensions.width && s.height === dimensions.height
-    );
-
-    if (!isValidSize) {
-      fs.unlinkSync(filename);
-      continue;
+    if (isAllowed && (isSocial || isDisplay)) {
+      form.append('files[]', fs.createReadStream(filename), { filename: attachment.name });
     }
-
-    formData.append('files[]', buffer, {
-      filename,
-      contentType: type.mime
-    });
 
     fs.unlinkSync(filename);
   }
 
-  const res = await fetch('https://api.adpiler.com/v1/creatives', {
+  const res = await fetch('https://app.adpiler.com/api/v1/creatives', {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${ADPILER_API_KEY}`,
-    },
-    body: formData
+    headers: { Authorization: `Bearer ${ADPILER_TOKEN}` },
+    body: form,
   });
 
-  return res.ok;
-};
-
-const addUploadedLabel = async (cardId) => {
-  const cardRes = await fetch(`https://api.trello.com/1/cards/${cardId}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`);
-  const cardData = await cardRes.json();
-  const boardId = cardData.idBoard;
-
-  const labelRes = await fetch(`https://api.trello.com/1/boards/${boardId}/labels?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`);
-  const labels = await labelRes.json();
-  let labelId = labels.find(l => l.name === 'Uploaded')?.id;
-
-  if (!labelId) {
-    const createLabelRes = await fetch(`https://api.trello.com/1/labels?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: 'Uploaded',
-        color: 'green',
-        idBoard: boardId
-      })
-    });
-    const newLabel = await createLabelRes.json();
-    labelId = newLabel.id;
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`AdPiler upload failed: ${errText}`);
   }
 
-  await fetch(`https://api.trello.com/1/cards/${cardId}/idLabels?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ value: labelId })
-  });
+  return true;
 };
 
 app.post('/api/upload-to-adpiler', async (req, res) => {
   try {
-    const action = req.body.action;
-    if (!action || action.type !== 'updateCard' || !action.data?.card) {
-      return res.status(200).send('Not a card update action');
-    }
+    const card = req.body.action?.data?.card;
+    if (!card) return res.status(400).send('No card data');
 
-    const cardId = action.data.card.id;
-    const cardRes = await fetch(`https://api.trello.com/1/cards/${cardId}?attachments=true&key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`);
-    const card = await cardRes.json();
+    await uploadToAdpiler(card);
 
-    const clientMap = await getClientMap();
-    const matchedClient = Object.keys(clientMap).find(name =>
-      card.name.toLowerCase().includes(name.toLowerCase())
-    );
-    const clientId = matchedClient ? clientMap[matchedClient] : null;
+    const boardId = req.body.model.id;
+    const labelId = await getOrCreateLabelId(boardId);
 
-    if (!clientId) return res.status(400).send('Client not matched');
+    await fetch(`https://api.trello.com/1/cards/${card.id}/idLabels?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: labelId }),
+    });
 
-    const uploaded = await uploadToAdpiler(card, clientId, card.attachments || []);
-    if (uploaded) await addUploadedLabel(cardId);
-
-    res.status(200).send('Upload success');
+    console.log(`✅ Uploaded card "${card.name}" to AdPiler`);
+    res.status(200).send('Uploaded to AdPiler');
   } catch (err) {
     console.error('❌ Upload error:', err);
     res.status(500).send('Upload failed');
