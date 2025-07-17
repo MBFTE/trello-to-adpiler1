@@ -21,7 +21,7 @@ const ADPILER_BASE_URL =
 
 let clientMap = {};
 
-// ▶️ Refresh mapping Trello client name → Adpiler campaign ID
+// Refresh clientMap at startup and every hour
 ;(async function refreshClientMap() {
   try {
     console.log('🔄 Refreshing client map…');
@@ -29,12 +29,14 @@ let clientMap = {};
     if (!res.ok) throw new Error(`CSV fetch ${res.status}`);
     const text = await res.text();
     const rows = await csv().fromString(text);
+
     clientMap = rows.reduce((map, row) => {
       const key = row['Trello Client Name']?.trim().toLowerCase();
       const id  = row['Adpiler Client ID']?.trim();
       if (key && id) map[key] = id;
       return map;
     }, {});
+
     console.log('✅ Loaded clients:', Object.keys(clientMap).join(', '));
   } catch (err) {
     console.error('❌ refreshClientMap error:', err.message);
@@ -53,18 +55,16 @@ async function getCardAttachments(cardId) {
 }
 
 async function downloadTrelloAttachment(cardId, att) {
-  // Try public URL
   let res = await fetch(att.url, { redirect: 'follow', timeout: 15000 });
   if (!res.ok) {
-    // Fallback to authenticated download
     const dl = `https://api.trello.com/1/cards/${cardId}`
              + `/attachments/${att.id}/download`
              + `?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
     res = await fetch(dl, { redirect: 'follow', timeout: 15000 });
     if (!res.ok) throw new Error(`download failed ${res.status}`);
   }
-  const buf = await res.arrayBuffer();
-  return Buffer.from(buf);
+  const arrayBuffer = await res.arrayBuffer();
+  return Buffer.from(arrayBuffer);
 }
 
 // ─── Health Checks ─────────────────────────────────────────────────────────────
@@ -144,17 +144,14 @@ app.post('/upload-to-adpiler', async (req, res) => {
 
     let uploadPath;
     if (format === 'social') {
-      // Social-ads endpoint & fields
       uploadPath = `/v1/campaign/${campaignId}/social-ads`;
       form.append('name',       cardName);
       form.append('network',    fieldMap['network']    || 'facebook');
       form.append('type',       fieldMap['type']       || 'post');
       form.append('page_name',  fieldMap['page name']  || '');
-      // use first successful buffer as logo
-      const logo = buffers.find(b => b);
+      const logo = buffers.find(b => b !== null);
       if (logo) form.append('logo', logo.buf, logo.name);
     } else {
-      // Display-ads endpoint & fields
       uploadPath = `/v1/campaign/${campaignId}/ads`;
       form.append('name',              cardName);
       form.append('width',             fieldMap['width']       || '300');
@@ -163,8 +160,7 @@ app.post('/upload-to-adpiler', async (req, res) => {
       form.append('max_height',        fieldMap['max height']  || '250');
       form.append('responsive_width',  'true');
       form.append('responsive_height', 'true');
-      // use first successful buffer as creative file
-      const file = buffers.find(b => b);
+      const file = buffers.find(b => b !== null);
       if (file) form.append('file', file.buf, file.name);
     }
 
@@ -179,6 +175,7 @@ app.post('/upload-to-adpiler', async (req, res) => {
         ...form.getHeaders(),
       },
       body: form,
+      timeout: 20000
     });
 
     if (!apiRes.ok) {
@@ -196,9 +193,8 @@ app.post('/upload-to-adpiler', async (req, res) => {
   }
 });
 
-// ─── Start Server ──────────────────────────────────────────────────────────────
+// ─── Start Server ───────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`🚀 Listening on port ${PORT}`);
 });
-```
