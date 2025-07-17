@@ -8,16 +8,19 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
-const CLIENT_CSV_URL = process.env.CLIENT_CSV_URL;
-const TARGET_LIST_NAME = process.env.TARGET_LIST_NAME;
+// Set this environment variable on Render (or your .env file), or hardcode:
+const CLIENT_CSV_URL = process.env.CLIENT_CSV_URL
+  || 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
+const TARGET_LIST_NAME = process.env.TARGET_LIST_NAME || "YOUR TARGET LIST NAME"; // Set as needed
 
-// In‐memory map Trello Client Name → Adpiler Client ID
+// In-memory map: lowercased Trello Client Name → Adpiler Client ID
 let clientMap = {};
 
-// Fetch and parse your Google Sheet CSV
+// Fetch and parse Google Sheet CSV
 async function refreshClientMap() {
   console.log('🔄 Refreshing client map from sheet…');
   try {
+    console.log('Fetching client map from:', CLIENT_CSV_URL);
     const res = await fetch(CLIENT_CSV_URL);
     if (!res.ok) throw new Error(`Status ${res.status}`);
     const text = await res.text();
@@ -25,8 +28,10 @@ async function refreshClientMap() {
 
     const map = {};
     for (const row of rows) {
+      // Normalize both keys and values for robustness
       if (row['Trello Client Name'] && row['Adpiler Client ID']) {
-        map[row['Trello Client Name'].trim()] = row['Adpiler Client ID'].trim();
+        const key = row['Trello Client Name'].trim().toLowerCase();
+        map[key] = row['Adpiler Client ID'].trim();
       }
     }
     clientMap = map;
@@ -50,19 +55,20 @@ app.get('/', (_req, res) => res.send('OK'));
 app.post('/upload-to-adpiler', async (req, res) => {
   const action = req.body.action;
   if (action?.type !== 'updateCard' || !action.data?.listAfter) {
-    // ignore everything except list moves
+    // Ignore everything except list moves
     return res.sendStatus(200);
   }
 
   const listName = action.data.listAfter.name;
   if (listName !== TARGET_LIST_NAME) {
-    // only trigger on your configured target list
+    // Only trigger on your configured target list
     return res.sendStatus(200);
   }
 
   const card = action.data.card;
   const cardName = card.name;
-  const clientName = cardName.split(':')[0].trim();
+  // Normalized to match map
+  const clientName = cardName.split(':')[0].trim().toLowerCase();
   const clientId = clientMap[clientName];
 
   if (!clientId) {
@@ -70,7 +76,7 @@ app.post('/upload-to-adpiler', async (req, res) => {
     return res.status(400).json({ error: `No Adpiler client for ${clientName}` });
   }
 
-  // find every attachment
+  // Find every attachment
   const attachments = action.data.card.attachments || [];
   if (attachments.length === 0) {
     console.log(`ℹ️  No attachments on "${cardName}"`);
@@ -79,18 +85,17 @@ app.post('/upload-to-adpiler', async (req, res) => {
 
   for (const att of attachments) {
     try {
-      // download the file
+      // Download the file
       const fileRes = await fetch(att.url);
       if (!fileRes.ok) throw new Error(`Download failed ${fileRes.status}`);
       const buffer = await fileRes.buffer();
 
-      // upload to Adpiler
+      // Upload to Adpiler
       const form = new FormData();
       form.append('name', att.name);
       form.append('file', buffer, att.name);
 
-      // here we've assumed that campaign ID = clientId;
-      // if you need a folder/campaign mapping, swap in your logic
+      // Assumes campaign ID = clientId
       const apiRes = await fetch(
         `https://platform.adpiler.com/api/campaigns/${clientId}/ads`,
         {
@@ -116,4 +121,3 @@ app.post('/upload-to-adpiler', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Listening on port ${PORT}`);
 });
-
