@@ -1,98 +1,108 @@
 // api/upload-to-adpiler.js
-
 import express from 'express';
 import fetch from 'node-fetch';
 import FormData from 'form-data';
+import { fromBuffer } from 'file-type';
 import csv from 'csvtojson';
-import sizeOf from 'image-size';
-import { fileTypeFromBuffer } from 'file-type';
 
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 10000;
-const CLIENT_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
-const ADPILER_API_KEY = process.env.ADPILER_API_KEY;
-const ADPILER_BASE_URL = process.env.ADPILER_BASE_URL || 'https://platform.adpiler.com/api';
-const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
+const PORT = process.env.PORT || 3000;
+const CSV_URL = 'https://docs.google.com/spreadsheets/d/e/…/pub?output=csv';
+const ADPILER_TOKEN = process.env.ADPILER_API_KEY;       // set in your Render/Env
+const TRELLO_TOKEN  = process.env.TRELLO_TOKEN;         // set in your Render/Env
 
+// map of Trello‑prefix → Adpiler client ID
 let clientMap = {};
 
+// load CSV once at startup
 async function loadClientMap() {
-  const res = await fetch(CLIENT_CSV_URL);
-  if (!res.ok) throw new Error(`Failed to fetch client CSV: ${res.status}`);
+  const res = await fetch(CSV_URL);
+  if (!res.ok) throw new Error(`Failed to fetch CSV (${res.status})`);
   const text = await res.text();
   const rows = await csv().fromString(text);
   rows.forEach(r => {
-    clientMap[r['Trello Client Name'].trim()] = r['Adpiler Client ID'].trim();
+    const key = r['Trello Client Name']?.trim();
+    const id  = r['Adpiler Client ID']?.trim();
+    if (key && id) clientMap[key] = id;
   });
-  console.log('Loaded client map:', clientMap);
+  console.log('▶️  clientMap loaded:', clientMap);
 }
-
 await loadClientMap();
 
-async function bufferFromUrl(url) {
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${TRELLO_TOKEN}` }
-  });
-  if (!res.ok) throw new Error(`Download failed ${res.status}`);
-  return await res.buffer();
-}
+// map your Trello list names → numeric Adpiler campaign IDs
+const CAMPAIGN_MAP = {
+  Clovis:  /* e.g. */ process.env.CAMPAIGN_CLOVIS_ID,
+  Roswell: process.env.CAMPAIGN_ROSWELL_ID,
+  // add more as needed…
+};
 
-async function uploadFileToAdpiler({ campaignId, name, buffer }) {
-  const type = await fileTypeFromBuffer(buffer);
-  if (!type) throw new Error('Unsupported file type: cannot determine MIME');
-
-  const { width, height } = sizeOf(buffer);
-
-  const form = new FormData();
-  form.append('name', name);
-  form.append('width', width);
-  form.append('height', height);
-  form.append('file', buffer, {
-    filename: `${name}.${type.ext}`,
-    contentType: type.mime,
-  });
-
-  const res = await fetch(`${ADPILER_BASE_URL}/campaigns/${campaignId}/ads`, {
-    method: 'POST',
-    headers: { 'X-API-KEY': ADPILER_API_KEY },
-    body: form
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`AdPiler upload failed ${res.status}: ${text}`);
-  }
-
-  return res.json();
+// download a Trello attachment buffer
+async function downloadAttachment(url) {
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${TRELLO_TOKEN}` } });
+  if (!r.ok) throw new Error(`Download failed ${r.status}`);
+  return r.buffer();
 }
 
 app.post('/upload-to-adpiler', async (req, res) => {
   try {
-    const card = req.body.action.data.card;
-    const cardName = card.name;
-    const clientKey = cardName.split(':')[0].trim();
-    const clientId = clientMap[clientKey];
-    if (!clientId) throw new Error(`No Adpiler client found for "${clientKey}"`);
+    const act = req.body.action?.data;
+    const card = act?.card;
+    const list = act?.list;
+    if (!card || !list) return res.status(400).json({ error: 'Invalid Trello webhook payload' });
 
-    const attachments = card.attachments || [];
-    for (const att of attachments) {
-      try {
-        const buf = await bufferFromUrl(att.url);
-        await uploadFileToAdpiler({ campaignId: clientId, name: cardName, buffer: buf });
-        console.log('Uploaded attachment:', att.url);
-      } catch (e) {
-        console.error('Attachment skipped/error:', e.message);
+    // extract the prefix before the colon
+    const rawPrefix = card.name.split(':')[0].trim();
+    // find a CSV key that rawPrefix *contains*
+    const clientKey = Object.keys(clientMap).find(k => rawPrefix.includes(k));
+    if (!clientKey) throw new Error(`No Adpiler client found for "${rawPrefix}"`);
+    const clientId = clientMap[clientKey];
+
+    // lookup campaign ID by Trello list name
+    const campaignId = CAMPAIGN_MAP[list.name];
+    if (!campaignId) throw new Error(`No campaign ID mapped for list "${list.name}"`);
+
+    const atts = card.attachments || [];
+    if (!atts.length) throw new Error('No attachments on this Trello card');
+
+    for (const att of atts) {
+      const buf = await downloadAttachment(att.url);
+      const ft = await fromBuffer(buf);
+      if (!ft) throw new Error(`Unsupported file type for ${att.url}`);
+
+      const form = new FormData();
+      form.append('name', card.name);
+      form.append('client_id', clientId);
+      form.append('file', buf, {
+        filename: att.name,
+        contentType: ft.mime
+      });
+
+      const apiRes = await fetch(
+        `https://platform.adpiler.com/api/campaigns/${campaignId}/ads`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${ADPILER_TOKEN}`,
+            ...form.getHeaders()
+          },
+          body: form
+        }
+      );
+      if (!apiRes.ok) {
+        const txt = await apiRes.text();
+        throw new Error(`Adpiler upload failed ${apiRes.status}: ${txt}`);
       }
     }
 
-    res.status(200).json({ success: true });
+    return res.json({ success: true });
   } catch (err) {
     console.error('❌ Upload error:', err);
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Listening on port ${PORT}`));
-
+app.listen(PORT, () => {
+  console.log(`🚀 Listening on port ${PORT}`);
+});
