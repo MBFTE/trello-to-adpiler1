@@ -52,23 +52,22 @@ async function getCardAttachments(cardId) {
 
 // Helper: Download an attachment robustly
 async function downloadTrelloAttachment(cardId, att) {
-  // 1. Try the meta url (often public)
   let fileRes = await fetch(att.url, { redirect: 'follow', timeout: 15000 });
   if (!fileRes.ok) {
-    // 2. Try the Trello authenticated download endpoint
     const trelloDownloadUrl = `https://api.trello.com/1/cards/${cardId}/attachments/${att.id}/download?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
     fileRes = await fetch(trelloDownloadUrl, { redirect: 'follow', timeout: 15000 });
     if (!fileRes.ok) {
       throw new Error(`Download failed ${fileRes.status}: ${fileRes.statusText}`);
     }
   }
-  return await fileRes.buffer();
+  const arrayBuffer = await fileRes.arrayBuffer();
+  return Buffer.from(arrayBuffer);
 }
 
 // Helper: Get list id by name from board
 async function getListIdByName(boardId, listName) {
   const url = `https://api.trello.com/1/boards/${boardId}/lists?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
-  const res = await fetch(url, {timeout: 10000});
+  const res = await fetch(url, { timeout: 10000 });
   if (!res.ok) throw new Error(`Failed to fetch lists: ${res.status}`);
   const lists = await res.json();
   const list = lists.find(l => l.name.trim().toLowerCase() === listName.trim().toLowerCase());
@@ -80,7 +79,7 @@ async function findCardIdByName(cardName, boardId, listName) {
   const listId = await getListIdByName(boardId, listName);
   if (!listId) return null;
   const url = `https://api.trello.com/1/lists/${listId}/cards?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
-  const res = await fetch(url, {timeout: 10000});
+  const res = await fetch(url, { timeout: 10000 });
   if (!res.ok) throw new Error(`Failed to fetch cards: ${res.status}`);
   const cards = await res.json();
   const card = cards.find(c => c.name.trim() === cardName.trim());
@@ -102,7 +101,6 @@ app.post('/upload-to-adpiler', async (req, res) => {
     let cardId = card.id;
     let cardName = card.name;
 
-    // Failsafe: If cardId is missing, search for it by name
     if (!cardId) {
       cardId = await findCardIdByName(cardName, TRELLO_BOARD_ID, TARGET_LIST_NAME);
       if (!cardId) {
@@ -111,7 +109,6 @@ app.post('/upload-to-adpiler', async (req, res) => {
       }
     }
 
-    // Get Adpiler clientId from mapping
     const clientName = cardName.split(':')[0].trim().toLowerCase();
     const clientId = clientMap[clientName];
     if (!clientId) {
@@ -119,7 +116,6 @@ app.post('/upload-to-adpiler', async (req, res) => {
       return res.status(400).json({ error: `No Adpiler client for ${clientName}` });
     }
 
-    // Get attachments
     let attachments = [];
     try {
       attachments = await getCardAttachments(cardId);
@@ -133,7 +129,6 @@ app.post('/upload-to-adpiler', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Upload each attachment robustly
     for (const att of attachments) {
       try {
         const buffer = await downloadTrelloAttachment(cardId, att);
@@ -145,10 +140,13 @@ app.post('/upload-to-adpiler', async (req, res) => {
           `https://platform.adpiler.com/api/campaigns/${clientId}/ads`,
           {
             method: 'POST',
-            headers: { 'X-API-KEY': ADPILER_API_KEY },
+            headers: {
+              'X-API-KEY': ADPILER_API_KEY,
+              ...form.getHeaders(),
+            },
             body: form,
             timeout: 20000,
-          },
+          }
         );
 
         if (!apiRes.ok) {
@@ -159,7 +157,6 @@ app.post('/upload-to-adpiler', async (req, res) => {
         console.log(`✅ Uploaded ${att.name} to campaign ${clientId}`);
       } catch (err) {
         console.error('❌ Upload error:', err.message, 'Attachment:', att.name, att.id, att.url);
-        // Continue to next attachment
       }
     }
 
@@ -169,6 +166,11 @@ app.post('/upload-to-adpiler', async (req, res) => {
     res.status(500).send('Internal server error');
   }
 });
+
+app.listen(PORT, () => {
+  console.log(`🚀 Listening on port ${PORT}`);
+});
+
 
 app.listen(PORT, () => {
   console.log(`🚀 Listening on port ${PORT}`);
