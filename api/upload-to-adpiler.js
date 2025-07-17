@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 10000;
 const CLIENT_CSV_URL = process.env.CLIENT_CSV_URL;
 const TARGET_LIST_NAME = process.env.TARGET_LIST_NAME;
 
-// In‐memory map Trello Client Name → AdPiler Client ID
+// In‐memory map Trello Client Name → Adpiler Client ID
 let clientMap = {};
 
 // Fetch and parse your Google Sheet CSV
@@ -66,8 +66,8 @@ app.post('/upload-to-adpiler', async (req, res) => {
   const clientId = clientMap[clientName];
 
   if (!clientId) {
-    console.error(`❌ No AdPiler client found for "${clientName}"`);
-    return res.status(400).json({ error: `No AdPiler client for ${clientName}` });
+    console.error(`❌ No Adpiler client found for "${clientName}"`);
+    return res.status(400).json({ error: `No Adpiler client for ${clientName}` });
   }
 
   // find every attachment
@@ -84,7 +84,7 @@ app.post('/upload-to-adpiler', async (req, res) => {
       if (!fileRes.ok) throw new Error(`Download failed ${fileRes.status}`);
       const buffer = await fileRes.buffer();
 
-      // upload to AdPiler
+      // upload to Adpiler
       const form = new FormData();
       form.append('name', att.name);
       form.append('file', buffer, att.name);
@@ -101,7 +101,7 @@ app.post('/upload-to-adpiler', async (req, res) => {
       );
       if (!apiRes.ok) {
         const text = await apiRes.text();
-        throw new Error(`AdPiler upload failed ${apiRes.status}: ${text.substring(0,200)}`);
+        throw new Error(`Adpiler upload failed ${apiRes.status}: ${text.substring(0,200)}`);
       }
 
       console.log(`✅ Uploaded ${att.name} to campaign ${clientId}`);
