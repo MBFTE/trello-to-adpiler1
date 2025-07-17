@@ -1,128 +1,101 @@
 // api/upload-to-adpiler.js
 import express from 'express';
 import fetch from 'node-fetch';
-import csv from 'csvtojson';
 import FormData from 'form-data';
-import { fileTypeFromBuffer } from 'file-type';
-import sizeOf from 'image-size';
+import csv from 'csvtojson';
 
-const PORT = process.env.PORT || 3000;
-const SHEET_URL = process.env.CLIENT_CSV_URL
-  || 'https://docs.google.com/spreadsheets/d/e/…/pub?output=csv';
-const ADPILER_API_KEY = process.env.ADPILER_API_KEY || 'YOUR_API_KEY_HERE';
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+// ←– your published‑to‑web CSV URL:
+const CLIENT_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
 
 let clientMap = {};
 
 /**
- * Fetch and parse the Google Sheet CSV into clientMap:
- *   { "Zia Clovis": "69144", "Zia Roswell": "69144", … }
+ * Fetches and parses the CSV, rebuilding clientMap[name] = id
  */
 async function refreshClientMap() {
-  console.log('🔄 Refreshing client map from sheet…');
-  const res = await fetch(SHEET_URL);
-  if (!res.ok) {
-    console.error(`❌ Failed to fetch CSV: ${res.status}`);
-    return;
+  try {
+    console.log('🔄 Refreshing client map from sheet…');
+    const resp = await fetch(CLIENT_CSV_URL);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const text = await resp.text();
+    const rows = await csv().fromString(text);
+
+    clientMap = {};
+    for (const row of rows) {
+      const name = row['Trello Client Name']?.trim();
+      const id   = row['Adpiler Client ID']?.trim();
+      if (name && id) clientMap[name] = id;
+    }
+    console.log('✅ Loaded clients:', clientMap);
+  } catch (err) {
+    console.error('❌ Failed to fetch CSV:', err.message);
   }
-  const text = await res.text();
-  const rows = await csv().fromString(text);
-  clientMap = {};
-  for (const row of rows) {
-    const name = row['Trello Client Name']?.trim();
-    const id   = row['Adpiler Client ID']?.trim();
-    if (name && id) clientMap[name] = id;
-  }
-  console.log('✅ Loaded client IDs for', Object.keys(clientMap).length, 'clients');
 }
 
 // initial load + hourly refresh
 await refreshClientMap();
-setInterval(refreshClientMap, 1000 * 60 * 60);
+setInterval(refreshClientMap, 60 * 60 * 1000);
 
-const app = express();
 app.use(express.json());
 
 app.post('/upload-to-adpiler', async (req, res) => {
-  try {
-    const card = req.body?.action?.data?.card;
-    if (!card || !card.name) {
-      return res.status(400).json({ error: 'No card data' });
-    }
+  const cardName = req.body?.action?.data?.card?.name;
+  if (!cardName) return res.status(400).json({ error: 'Missing card name' });
 
-    // extract client name from "ClientName: Ad title"
-    const fullName   = card.name;
-    const clientName = fullName.split(':')[0].trim();
-    const clientId   = clientMap[clientName];
-    if (!clientId) {
-      console.error(`❌ No AdPiler client found for "${clientName}"`);
-      return res.status(404).json({ error: `No AdPiler client for "${clientName}"` });
-    }
+  // before colon is your key in the CSV
+  const clientKey = cardName.split(':')[0].trim();
+  const clientId  = clientMap[clientKey];
+  if (!clientId) {
+    console.error(`❌ No AdPiler client found for "${clientKey}"`);
+    return res.status(404).json({ error: `No AdPiler client for "${clientKey}"` });
+  }
 
-    const attachments = card.attachments || [];
-    if (!attachments.length) {
-      console.log('ℹ️ No attachments to upload for', fullName);
-      return res.json({ success: true, uploaded: 0 });
-    }
+  // any attachments on the Trello card?
+  const attachments = req.body.action.data.card.attachments || [];
+  if (!attachments.length) {
+    console.error('❌ No attachments to upload');
+    return res.status(400).json({ error: 'No attachments' });
+  }
 
-    let uploadedCount = 0;
-    for (const att of attachments) {
+  for (const att of attachments) {
+    try {
       // download the file
-      const fileRes = await fetch(att.url);
-      if (!fileRes.ok) {
-        console.error('❌ Download failed', att.url, fileRes.status);
+      const fileResp = await fetch(att.url);
+      if (!fileResp.ok) {
+        console.error(`❌ Download failed ${fileResp.status}`);
         continue;
       }
-      const buffer = Buffer.from(await fileRes.arrayBuffer());
+      const buffer = await fileResp.buffer();
 
-      // detect mime and extension
-      const ft = await fileTypeFromBuffer(buffer);
-      if (!ft) {
-        console.error('❌ Unsupported file type for', att.name);
-        continue;
-      }
-
-      // get dimensions
-      let dims;
-      try {
-        dims = sizeOf(buffer);
-      } catch (e) {
-        console.warn('⚠️ Could not read image dimensions for', att.name, e.message);
-      }
-
-      // build form
+      // build multipart form
       const form = new FormData();
-      form.append('name',       fullName);
-      form.append('campaign',   clientId);                // path param too, but keep for body
-      if (dims) {
-        form.append('width',    dims.width.toString());
-        form.append('height',   dims.height.toString());
-      }
-      form.append('file', buffer, { 
-        filename: att.name, 
-        contentType: ft.mime 
-      });
+      form.append('campaign', clientId);             // path param in docs is {campaign}
+      form.append('name', att.name || 'attachment');
+      form.append('file', buffer, { filename: att.name });
 
-      // fire off the upload
-      const apiUrl = `https://platform.adpiler.com/api/clients/${clientId}/folders/${att.idFolder}/campaigns/${att.idCampaign}/ads`;
-      // adjust the path above to match your folder/campaign structure…
+      // send to AdPiler
+      const apiUrl = `https://platform.adpiler.com/api/campaigns/${clientId}/ads`;
       const adpilerRes = await fetch(apiUrl, {
         method: 'POST',
-        headers: { 'X-API-KEY': ADPILER_API_KEY },
+        headers: { 'X-API-KEY': process.env.ADPILER_API_KEY },
         body: form
       });
-      const text = await adpilerRes.text();
-      if (!adpilerRes.ok) {
-        console.error(`❌ AdPiler upload failed ${adpilerRes.status}:`, text);
-      } else {
-        uploadedCount++;
-      }
-    }
 
-    res.json({ success: true, uploaded: uploadedCount });
-  } catch (err) {
-    console.error('🔥 Upload error:', err);
-    res.status(500).json({ error: err.message });
+      if (!adpilerRes.ok) {
+        const bodyText = await adpilerRes.text();
+        console.error(`❌ AdPiler upload failed ${adpilerRes.status}: ${bodyText}`);
+      } else {
+        console.log(`✅ Uploaded "${att.name}" to campaign ${clientId}`);
+      }
+    } catch (err) {
+      console.error('❌ Upload error:', err);
+    }
   }
+
+  res.json({ success: true });
 });
 
 app.listen(PORT, () => {
