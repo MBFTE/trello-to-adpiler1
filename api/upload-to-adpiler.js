@@ -9,17 +9,18 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
-const CLIENT_CSV_URL = process.env.CLIENT_CSV_URL
-  || 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
-const TARGET_LIST_NAME = process.env.TARGET_LIST_NAME || "READY FOR ADPILER"; // Update as needed
+const CLIENT_CSV_URL =
+  process.env.CLIENT_CSV_URL ||
+  'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
+const TARGET_LIST_NAME = process.env.TARGET_LIST_NAME || 'READY FOR ADPILER';
 
-// Required: set these in Render dashboard (or .env)
 const TRELLO_API_KEY = process.env.TRELLO_API_KEY;
 const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
 const ADPILER_API_KEY = process.env.ADPILER_API_KEY;
 
 let clientMap = {};
 
+// Load client map from Google Sheets CSV
 async function refreshClientMap() {
   console.log('🔄 Refreshing client map from sheet…');
   try {
@@ -47,22 +48,23 @@ async function refreshClientMap() {
 await refreshClientMap();
 setInterval(refreshClientMap, 1000 * 60 * 60);
 
-// --- Helper to fetch attachments from Trello API ---
+// Helper: fetch attachments from Trello API
 async function getCardAttachments(cardId) {
-  if (!TRELLO_API_KEY || !TRELLO_TOKEN) throw new Error("Missing Trello API credentials");
+  if (!TRELLO_API_KEY || !TRELLO_TOKEN)
+    throw new Error('Missing Trello API credentials');
   const url = `https://api.trello.com/1/cards/${cardId}/attachments?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Failed to fetch attachments: ${res.status}`);
   return res.json();
 }
 
-// --- Webhook verification endpoint ---
+// HEAD handler for Trello webhook verification
 app.head('/upload-to-adpiler', (_req, res) => res.sendStatus(200));
 
-// --- Health check ---
+// Health check
 app.get('/', (_req, res) => res.send('OK'));
 
-// --- Main webhook handler ---
+// Main webhook handler
 app.post('/upload-to-adpiler', async (req, res) => {
   const action = req.body.action;
   if (action?.type !== 'updateCard' || !action.data?.listAfter) {
@@ -89,8 +91,8 @@ app.post('/upload-to-adpiler', async (req, res) => {
   try {
     attachments = await getCardAttachments(cardId);
   } catch (err) {
-    console.error("❌ Failed to fetch attachments from Trello:", err.message);
-    return res.status(500).json({ error: "Failed to fetch attachments from Trello" });
+    console.error('❌ Failed to fetch attachments from Trello:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch attachments from Trello' });
   }
 
   if (!attachments.length) {
@@ -100,10 +102,13 @@ app.post('/upload-to-adpiler', async (req, res) => {
 
   for (const att of attachments) {
     try {
-      const fileRes = await fetch(att.url);
+      // Download attachment with Trello API key/token for private files
+      const urlWithAuth = `${att.url}${att.url.includes('?') ? '&' : '?'}key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
+      const fileRes = await fetch(urlWithAuth);
       if (!fileRes.ok) throw new Error(`Download failed ${fileRes.status}`);
       const buffer = await fileRes.buffer();
 
+      // Upload to Adpiler
       const form = new FormData();
       form.append('name', att.name);
       form.append('file', buffer, att.name);
@@ -113,12 +118,12 @@ app.post('/upload-to-adpiler', async (req, res) => {
         {
           method: 'POST',
           headers: { 'X-API-KEY': ADPILER_API_KEY },
-          body: form
-        }
+          body: form,
+        },
       );
       if (!apiRes.ok) {
         const text = await apiRes.text();
-        throw new Error(`Adpiler upload failed ${apiRes.status}: ${text.substring(0,200)}`);
+        throw new Error(`Adpiler upload failed ${apiRes.status}: ${text.substring(0, 200)}`);
       }
 
       console.log(`✅ Uploaded ${att.name} to campaign ${clientId}`);
