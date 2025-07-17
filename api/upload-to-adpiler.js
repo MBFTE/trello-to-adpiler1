@@ -68,21 +68,44 @@ const uploadToAdpiler = async (card, clientId, attachments) => {
     await downloadFile(attachment.url, filename);
 
     const buffer = fs.readFileSync(filename);
-    const dimensions = ext === '.mp4' ? { width: 1200, height: 1200 } : sizeOf(buffer);
+    const type = await fileTypeFromBuffer(buffer);
+
+    // Skip if we can't detect MIME type
+    if (!type || !type.mime) {
+      console.warn(`⚠️ Skipping file: Cannot detect MIME type for ${filename}`);
+      fs.unlinkSync(filename);
+      continue;
+    }
+
+    // Get dimensions (skip for video)
+    let dimensions = { width: 1200, height: 1200 };
+    if (!type.mime.startsWith('video')) {
+      try {
+        dimensions = sizeOf(buffer);
+      } catch (err) {
+        console.warn(`⚠️ Skipping file: Cannot read dimensions for ${filename}`, err);
+        fs.unlinkSync(filename);
+        continue;
+      }
+    }
 
     const validSizes = [
       { width: 1200, height: 1200 },
       { width: 300, height: 600 }
     ];
 
-    const isValidSize = validSizes.some(s => s.width === dimensions.width && s.height === dimensions.height);
+    const isValidSize = validSizes.some(
+      s => s.width === dimensions.width && s.height === dimensions.height
+    );
+
     if (!isValidSize) {
+      console.warn(`⚠️ Skipping file: Invalid size ${dimensions.width}x${dimensions.height}`);
       fs.unlinkSync(filename);
       continue;
     }
 
-    const type = await fileTypeFromBuffer(buffer);
-    formData.append('files[]', buffer, { filename, contentType: type?.mime });
+    // ✅ Add file to form
+    formData.append('files[]', buffer, { filename, contentType: type.mime });
     fs.unlinkSync(filename);
   }
 
@@ -90,6 +113,7 @@ const uploadToAdpiler = async (card, clientId, attachments) => {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${ADPILER_API_KEY}`,
+      ...formData.getHeaders()
     },
     body: formData
   });
@@ -103,17 +127,13 @@ const addUploadedLabel = async (cardId) => {
   let labelId = labels.find(l => l.name === 'Uploaded')?.id;
 
   if (!labelId) {
-    const cardRes = await fetch(`https://api.trello.com/1/cards/${cardId}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`);
-    const cardData = await cardRes.json();
-    const boardId = cardData.idBoard;
-
     const createLabelRes = await fetch(`https://api.trello.com/1/labels?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name: 'Uploaded',
         color: 'green',
-        idBoard: boardId
+        idBoard: cardId
       })
     });
     const newLabel = await createLabelRes.json();
