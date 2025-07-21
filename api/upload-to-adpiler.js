@@ -1,5 +1,3 @@
-// api/upload-to-adpiler.js
-
 import express from 'express';
 import fetch from 'node-fetch';
 import FormData from 'form-data';
@@ -20,7 +18,6 @@ let clientMap = {};
 
 ;(async function refreshClientMap() {
   try {
-    console.log('🔄 Refreshing client map…');
     const res = await fetch(CLIENT_CSV_URL, { timeout: 15000 });
     if (!res.ok) throw new Error(`CSV fetch ${res.status}`);
     const text = await res.text();
@@ -31,7 +28,6 @@ let clientMap = {};
       if (key && id) map[key] = id;
       return map;
     }, {});
-    console.log('✅ Loaded clients:', Object.keys(clientMap).join(', '));
   } catch (err) {
     console.error('❌ refreshClientMap error:', err.message);
   }
@@ -96,25 +92,24 @@ app.post('/upload-to-adpiler', async (req, res) => {
     const clientKey  = cardName.split(':')[0].trim().toLowerCase();
     const campaignId = clientMap[clientKey];
     if (!campaignId) {
-      console.error(`❌ No campaign for "${clientKey}"`);
       return res.status(400).json({ error: `No campaign for ${clientKey}` });
     }
 
+    const attachments = await getCardAttachments(cardId);
+    const buffers = await Promise.all(
+      attachments.map(att =>
+        downloadTrelloAttachment(cardId, att)
+          .then(buf => ({ name: att.name, buf }))
+          .catch(err => {
+            console.error(`❌ download "${att.name}" failed:`, err.message);
+            return null;
+          })
+      )
+    );
+
     const url = `${ADPILER_BASE_URL}/campaigns/${campaignId}/${format === 'social' ? 'social-ads' : 'ads'}`;
-    console.log(`➡️ Uploading ${format} ad to`, url);
 
     if (format === 'social') {
-      const attachments = await getCardAttachments(cardId);
-      const buffers = await Promise.all(
-        attachments.map(att =>
-          downloadTrelloAttachment(cardId, att)
-            .then(buf => ({ name: att.name, buf }))
-            .catch(err => {
-              console.error(`❌ download "${att.name}" failed:`, err.message);
-              return null;
-            })
-        )
-      );
       const imageFile = buffers.find(b => b !== null);
       const logoBase64 = imageFile
         ? `data:image/png;base64,${imageFile.buf.toString('base64')}`
@@ -140,25 +135,11 @@ app.post('/upload-to-adpiler', async (req, res) => {
 
       if (!apiRes.ok) {
         const body = await apiRes.text();
-        console.error(`❌ Adpiler ${apiRes.status}:`, body);
         return res.status(apiRes.status).send(body);
       }
 
-      console.log(`✅ Social ad uploaded for campaign ${campaignId}`);
       return res.sendStatus(200);
     }
-
-    const attachments = await getCardAttachments(cardId);
-    const buffers = await Promise.all(
-      attachments.map(att =>
-        downloadTrelloAttachment(cardId, att)
-          .then(buf => ({ name: att.name, buf }))
-          .catch(err => {
-            console.error(`❌ download "${att.name}" failed:`, err.message);
-            return null;
-          })
-      )
-    );
 
     const file = buffers.find(b => b !== null);
     const form = new FormData();
@@ -188,13 +169,18 @@ app.post('/upload-to-adpiler', async (req, res) => {
 
     if (!apiRes.ok) {
       const body = await apiRes.text();
-      console.error(`❌ Adpiler ${apiRes.status}:`, body);
       return res.status(apiRes.status).send(body);
     }
 
-    console.log(`✅ Display ad uploaded for campaign ${campaignId}`);
     return res.sendStatus(200);
 
   } catch (err) {
     console.error('❌ Handler error:', err.message);
-    return res.status(500).send
+    return res.status(500).send('Internal server error');
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Listening on port ${PORT}`);
+});
+```
