@@ -9,19 +9,15 @@ const app = express();
 app.use(express.json());
 
 const PORT             = process.env.PORT || 3000;
-const CLIENT_CSV_URL   =
-  process.env.CLIENT_CSV_URL ||
-  'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
+const CLIENT_CSV_URL   = process.env.CLIENT_CSV_URL || 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
 const TARGET_LIST_NAME = process.env.TARGET_LIST_NAME || 'READY FOR ADPILER';
 const TRELLO_API_KEY   = process.env.TRELLO_API_KEY;
 const TRELLO_TOKEN     = process.env.TRELLO_TOKEN;
 const ADPILER_API_KEY  = process.env.ADPILER_API_KEY;
-const ADPILER_BASE_URL =
-  process.env.ADPILER_BASE_URL || 'https://platform.adpiler.com/api';
+const ADPILER_BASE_URL = process.env.ADPILER_BASE_URL || 'https://platform.adpiler.com/api';
 
 let clientMap = {};
 
-// Refresh clientMap at startup and every hour
 ;(async function refreshClientMap() {
   try {
     console.log('🔄 Refreshing client map…');
@@ -36,7 +32,6 @@ let clientMap = {};
       if (key && id) map[key] = id;
       return map;
     }, {});
-
     console.log('✅ Loaded clients:', Object.keys(clientMap).join(', '));
   } catch (err) {
     console.error('❌ refreshClientMap error:', err.message);
@@ -44,11 +39,8 @@ let clientMap = {};
   setTimeout(refreshClientMap, 1000 * 60 * 60);
 })();
 
-// ─── Trello Helpers ────────────────────────────────────────────────────────────
-
 async function getCardAttachments(cardId) {
-  const url = `https://api.trello.com/1/cards/${cardId}/attachments`
-    + `?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
+  const url = `https://api.trello.com/1/cards/${cardId}/attachments?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
   const res = await fetch(url, { timeout: 10000 });
   if (!res.ok) throw new Error(`getCardAttachments ${res.status}`);
   return res.json();
@@ -57,9 +49,7 @@ async function getCardAttachments(cardId) {
 async function downloadTrelloAttachment(cardId, att) {
   let res = await fetch(att.url, { redirect: 'follow', timeout: 15000 });
   if (!res.ok) {
-    const dl = `https://api.trello.com/1/cards/${cardId}`
-             + `/attachments/${att.id}/download`
-             + `?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
+    const dl = `https://api.trello.com/1/cards/${cardId}/attachments/${att.id}/download?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
     res = await fetch(dl, { redirect: 'follow', timeout: 15000 });
     if (!res.ok) throw new Error(`download failed ${res.status}`);
   }
@@ -67,12 +57,8 @@ async function downloadTrelloAttachment(cardId, att) {
   return Buffer.from(arrayBuffer);
 }
 
-// ─── Health Checks ─────────────────────────────────────────────────────────────
-
 app.head('/upload-to-adpiler', (_req, res) => res.sendStatus(200));
-app.get('/',               (_req, res) => res.send('OK'));
-
-// ─── Webhook Handler ───────────────────────────────────────────────────────────
+app.get('/', (_req, res) => res.send('OK'));
 
 app.post('/upload-to-adpiler', async (req, res) => {
   try {
@@ -86,16 +72,12 @@ app.post('/upload-to-adpiler', async (req, res) => {
 
     const cardId = action.data.card.id;
 
-    // 1️⃣ Fetch card details including labels
     const cardRes = await fetch(
-      `https://api.trello.com/1/cards/${cardId}`
-      + `?fields=name,desc,url,labels`
-      + `&key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`
+      `https://api.trello.com/1/cards/${cardId}?fields=name,desc,url,labels&key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`
     );
     if (!cardRes.ok) throw new Error(`card fetch ${cardRes.status}`);
     const { name: cardName, desc = '', labels = [] } = await cardRes.json();
 
-    // 2️⃣ Parse ad‐copy fields from description
     const fieldMap = {};
     desc.split('\n').forEach(line => {
       const [rawKey, ...vals] = line.split(':');
@@ -108,11 +90,9 @@ app.post('/upload-to-adpiler', async (req, res) => {
     const callToAction    = fieldMap['call to action']    || '';
     const clickUrl        = fieldMap['click through url'] || '';
 
-    // 3️⃣ Determine ad format from Trello labels
     const labelNames = labels.map(l => l.name.trim().toLowerCase());
     const format     = labelNames.includes('social') ? 'social' : 'display';
 
-    // 4️⃣ Map Trello client → Adpiler campaign
     const clientKey  = cardName.split(':')[0].trim().toLowerCase();
     const campaignId = clientMap[clientKey];
     if (!campaignId) {
@@ -120,7 +100,6 @@ app.post('/upload-to-adpiler', async (req, res) => {
       return res.status(400).json({ error: `No campaign for ${clientKey}` });
     }
 
-    // 5️⃣ Download attachments
     const attachments = await getCardAttachments(cardId);
     const buffers = await Promise.all(
       attachments.map(att =>
@@ -133,26 +112,38 @@ app.post('/upload-to-adpiler', async (req, res) => {
       )
     );
 
-    // 6️⃣ Build FormData
-    const form = new FormData();
-    // common ad-copy fields
-    form.append('primary_text',      primaryText);
-    form.append('headline',          headline);
-    form.append('description',       descriptionText);
-    form.append('call_to_action',    callToAction);
-    form.append('click_through_url', clickUrl);
+    const logoFile = buffers.find(b => b !== null);
+    const logoBase64 = logoFile ? logoFile.buf.toString('base64') : '';
 
-    let uploadPath;
+    const url = `${ADPILER_BASE_URL}/campaigns/${campaignId}/${format === 'social' ? 'social-ads' : 'ads'}`;
+    console.log(`➡️ Uploading ${format} ad to`, url);
+
+    let apiRes;
+
     if (format === 'social') {
-      uploadPath = `/campaigns/${campaignId}/social-ads`; // ✅ corrected
-      form.append('name',       cardName);
-      form.append('network',    fieldMap['network']    || 'facebook');
-      form.append('type',       fieldMap['type']       || 'post');
-      form.append('page_name',  fieldMap['page name']  || '');
-      const logo = buffers.find(b => b !== null);
-      if (logo) form.append('logo', logo.buf, logo.name);
+      const payload = {
+        name: cardName,
+        network: fieldMap['network'] || 'facebook',
+        type: fieldMap['type'] || 'post',
+        page_name: fieldMap['page name'] || '',
+        logo: logoBase64
+      };
+      apiRes = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${ADPILER_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload),
+        timeout: 20000
+      });
     } else {
-      uploadPath = `/campaigns/${campaignId}/ads`; // ✅ corrected
+      const form = new FormData();
+      form.append('primary_text',      primaryText);
+      form.append('headline',          headline);
+      form.append('description',       descriptionText);
+      form.append('call_to_action',    callToAction);
+      form.append('click_through_url', clickUrl);
       form.append('name',              cardName);
       form.append('width',             fieldMap['width']       || '300');
       form.append('height',            fieldMap['height']      || '250');
@@ -160,23 +151,20 @@ app.post('/upload-to-adpiler', async (req, res) => {
       form.append('max_height',        fieldMap['max height']  || '250');
       form.append('responsive_width',  'true');
       form.append('responsive_height', 'true');
+
       const file = buffers.find(b => b !== null);
       if (file) form.append('file', file.buf, file.name);
+
+      apiRes = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${ADPILER_API_KEY}`,
+          ...form.getHeaders()
+        },
+        body: form,
+        timeout: 20000
+      });
     }
-
-    // 7️⃣ Upload to Adpiler
-    const url = `${ADPILER_BASE_URL}${uploadPath}`;
-    console.log(`➡️ Uploading ${format} ad to`, url);
-
-    const apiRes = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${ADPILER_API_KEY}`,
-        ...form.getHeaders(),
-      },
-      body: form,
-      timeout: 20000
-    });
 
     if (!apiRes.ok) {
       const body = await apiRes.text();
@@ -193,9 +181,6 @@ app.post('/upload-to-adpiler', async (req, res) => {
   }
 });
 
-// ─── Start Server ───────────────────────────────────────────────────────────────
-
 app.listen(PORT, () => {
   console.log(`🚀 Listening on port ${PORT}`);
 });
-
