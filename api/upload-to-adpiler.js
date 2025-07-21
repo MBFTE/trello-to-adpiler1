@@ -1,18 +1,3 @@
-Got it. Here's your updated `upload-to-adpiler.js` script with support for uploading **graphic files for social ads** — assuming Adpiler's `/social-ads` endpoint accepts base64-encoded image content as part of the payload.
-
-We’ll include the graphic in the payload using `logo: "data:image/png;base64,...` if an image attachment is available.
-
----
-
-### ✅ Updated Behavior
-- Display ads → uploaded via `multipart/form-data` with creative files
-- Social ads → uploaded via `application/json`, including:
-  - Ad metadata (name, network, type, page_name)
-  - A base64-encoded image file embedded as `logo`
-
----
-
-```js
 // api/upload-to-adpiler.js
 
 import express from 'express';
