@@ -1,3 +1,16 @@
+You've got it — here's your updated and fully functional script that **supports both display ads and social ads**. Social ads are uploaded using a **JSON payload** with optional metadata (no creative files), while display ads continue using `multipart/form-data` for file uploads.
+
+---
+
+### ✅ What’s New in This Version
+
+- **Display Ads** → Uploaded with creative files (unchanged)
+- **Social Ads** → Uploaded with metadata-only JSON payload (e.g. name, network, type, page name)
+- **Logo handling removed**, as you said it's not a priority
+
+---
+
+```js
 // api/upload-to-adpiler.js
 
 import express from 'express';
@@ -25,7 +38,6 @@ let clientMap = {};
     if (!res.ok) throw new Error(`CSV fetch ${res.status}`);
     const text = await res.text();
     const rows = await csv().fromString(text);
-
     clientMap = rows.reduce((map, row) => {
       const key = row['Trello Client Name']?.trim().toLowerCase();
       const id  = row['Adpiler Client ID']?.trim();
@@ -84,6 +96,7 @@ app.post('/upload-to-adpiler', async (req, res) => {
       if (!rawKey || vals.length === 0) return;
       fieldMap[rawKey.trim().toLowerCase()] = vals.join(':').trim();
     });
+
     const primaryText     = fieldMap['primary text']      || '';
     const headline        = fieldMap['headline']          || '';
     const descriptionText = fieldMap['description']       || '';
@@ -100,21 +113,6 @@ app.post('/upload-to-adpiler', async (req, res) => {
       return res.status(400).json({ error: `No campaign for ${clientKey}` });
     }
 
-    const attachments = await getCardAttachments(cardId);
-    const buffers = await Promise.all(
-      attachments.map(att =>
-        downloadTrelloAttachment(cardId, att)
-          .then(buf => ({ name: att.name, buf }))
-          .catch(err => {
-            console.error(`❌ download "${att.name}" failed:`, err.message);
-            return null;
-          })
-      )
-    );
-
-    const logoFile = buffers.find(b => b !== null);
-    const logoBase64 = logoFile ? logoFile.buf.toString('base64') : '';
-
     const url = `${ADPILER_BASE_URL}/campaigns/${campaignId}/${format === 'social' ? 'social-ads' : 'ads'}`;
     console.log(`➡️ Uploading ${format} ad to`, url);
 
@@ -125,8 +123,7 @@ app.post('/upload-to-adpiler', async (req, res) => {
         name: cardName,
         network: fieldMap['network'] || 'facebook',
         type: fieldMap['type'] || 'post',
-        page_name: fieldMap['page name'] || '',
-        logo: logoBase64
+        page_name: fieldMap['page name'] || ''
       };
       apiRes = await fetch(url, {
         method: 'POST',
@@ -138,6 +135,19 @@ app.post('/upload-to-adpiler', async (req, res) => {
         timeout: 20000
       });
     } else {
+      const attachments = await getCardAttachments(cardId);
+      const buffers = await Promise.all(
+        attachments.map(att =>
+          downloadTrelloAttachment(cardId, att)
+            .then(buf => ({ name: att.name, buf }))
+            .catch(err => {
+              console.error(`❌ download "${att.name}" failed:`, err.message);
+              return null;
+            })
+        )
+      );
+
+      const file = buffers.find(b => b !== null);
       const form = new FormData();
       form.append('primary_text',      primaryText);
       form.append('headline',          headline);
@@ -151,8 +161,6 @@ app.post('/upload-to-adpiler', async (req, res) => {
       form.append('max_height',        fieldMap['max height']  || '250');
       form.append('responsive_width',  'true');
       form.append('responsive_height', 'true');
-
-      const file = buffers.find(b => b !== null);
       if (file) form.append('file', file.buf, file.name);
 
       apiRes = await fetch(url, {
@@ -184,3 +192,8 @@ app.post('/upload-to-adpiler', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Listening on port ${PORT}`);
 });
+```
+
+---
+
+Let me know if you'd like to add validation for required fields in the JSON payload or add dry-run support for testing payloads before upload. You're steering this ship like a pro.
