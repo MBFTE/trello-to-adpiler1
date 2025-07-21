@@ -1,12 +1,14 @@
-You've got it — here's your updated and fully functional script that **supports both display ads and social ads**. Social ads are uploaded using a **JSON payload** with optional metadata (no creative files), while display ads continue using `multipart/form-data` for file uploads.
+Got it. Here's your updated `upload-to-adpiler.js` script with support for uploading **graphic files for social ads** — assuming Adpiler's `/social-ads` endpoint accepts base64-encoded image content as part of the payload.
+
+We’ll include the graphic in the payload using `logo: "data:image/png;base64,...` if an image attachment is available.
 
 ---
 
-### ✅ What’s New in This Version
-
-- **Display Ads** → Uploaded with creative files (unchanged)
-- **Social Ads** → Uploaded with metadata-only JSON payload (e.g. name, network, type, page name)
-- **Logo handling removed**, as you said it's not a priority
+### ✅ Updated Behavior
+- Display ads → uploaded via `multipart/form-data` with creative files
+- Social ads → uploaded via `application/json`, including:
+  - Ad metadata (name, network, type, page_name)
+  - A base64-encoded image file embedded as `logo`
 
 ---
 
@@ -116,25 +118,7 @@ app.post('/upload-to-adpiler', async (req, res) => {
     const url = `${ADPILER_BASE_URL}/campaigns/${campaignId}/${format === 'social' ? 'social-ads' : 'ads'}`;
     console.log(`➡️ Uploading ${format} ad to`, url);
 
-    let apiRes;
-
     if (format === 'social') {
-      const payload = {
-        name: cardName,
-        network: fieldMap['network'] || 'facebook',
-        type: fieldMap['type'] || 'post',
-        page_name: fieldMap['page name'] || ''
-      };
-      apiRes = await fetch(url, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${ADPILER_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload),
-        timeout: 20000
-      });
-    } else {
       const attachments = await getCardAttachments(cardId);
       const buffers = await Promise.all(
         attachments.map(att =>
@@ -146,33 +130,76 @@ app.post('/upload-to-adpiler', async (req, res) => {
             })
         )
       );
+      const imageFile = buffers.find(b => b !== null);
+      const logoBase64 = imageFile
+        ? `data:image/png;base64,${imageFile.buf.toString('base64')}`
+        : '';
 
-      const file = buffers.find(b => b !== null);
-      const form = new FormData();
-      form.append('primary_text',      primaryText);
-      form.append('headline',          headline);
-      form.append('description',       descriptionText);
-      form.append('call_to_action',    callToAction);
-      form.append('click_through_url', clickUrl);
-      form.append('name',              cardName);
-      form.append('width',             fieldMap['width']       || '300');
-      form.append('height',            fieldMap['height']      || '250');
-      form.append('max_width',         fieldMap['max width']   || '300');
-      form.append('max_height',        fieldMap['max height']  || '250');
-      form.append('responsive_width',  'true');
-      form.append('responsive_height', 'true');
-      if (file) form.append('file', file.buf, file.name);
+      const payload = {
+        name: cardName,
+        network: fieldMap['network'] || 'facebook',
+        type: fieldMap['type'] || 'post',
+        page_name: fieldMap['page name'] || '',
+        logo: logoBase64
+      };
 
-      apiRes = await fetch(url, {
+      const apiRes = await fetch(url, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${ADPILER_API_KEY}`,
-          ...form.getHeaders()
+          'Content-Type': 'application/json'
         },
-        body: form,
+        body: JSON.stringify(payload),
         timeout: 20000
       });
+
+      if (!apiRes.ok) {
+        const body = await apiRes.text();
+        console.error(`❌ Adpiler ${apiRes.status}:`, body);
+        return res.status(apiRes.status).send(body);
+      }
+
+      console.log(`✅ Social ad uploaded for campaign ${campaignId}`);
+      return res.sendStatus(200);
     }
+
+    const attachments = await getCardAttachments(cardId);
+    const buffers = await Promise.all(
+      attachments.map(att =>
+        downloadTrelloAttachment(cardId, att)
+          .then(buf => ({ name: att.name, buf }))
+          .catch(err => {
+            console.error(`❌ download "${att.name}" failed:`, err.message);
+            return null;
+          })
+      )
+    );
+
+    const file = buffers.find(b => b !== null);
+    const form = new FormData();
+    form.append('primary_text',      primaryText);
+    form.append('headline',          headline);
+    form.append('description',       descriptionText);
+    form.append('call_to_action',    callToAction);
+    form.append('click_through_url', clickUrl);
+    form.append('name',              cardName);
+    form.append('width',             fieldMap['width']       || '300');
+    form.append('height',            fieldMap['height']      || '250');
+    form.append('max_width',         fieldMap['max width']   || '300');
+    form.append('max_height',        fieldMap['max height']  || '250');
+    form.append('responsive_width',  'true');
+    form.append('responsive_height', 'true');
+    if (file) form.append('file', file.buf, file.name);
+
+    const apiRes = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${ADPILER_API_KEY}`,
+        ...form.getHeaders()
+      },
+      body: form,
+      timeout: 20000
+    });
 
     if (!apiRes.ok) {
       const body = await apiRes.text();
@@ -180,20 +207,9 @@ app.post('/upload-to-adpiler', async (req, res) => {
       return res.status(apiRes.status).send(body);
     }
 
-    console.log(`✅ ${format} ad uploaded for campaign ${campaignId}`);
+    console.log(`✅ Display ad uploaded for campaign ${campaignId}`);
     return res.sendStatus(200);
 
   } catch (err) {
     console.error('❌ Handler error:', err.message);
-    return res.status(500).send('Internal server error');
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`🚀 Listening on port ${PORT}`);
-});
-```
-
----
-
-Let me know if you'd like to add validation for required fields in the JSON payload or add dry-run support for testing payloads before upload. You're steering this ship like a pro.
+    return res.status(500).send
