@@ -7,32 +7,38 @@ async function uploadToAdpiler(cardId, keys) {
     TRELLO_KEY,
     TRELLO_TOKEN,
     ADPILER_API_KEY,
-    ADPILER_BASE_URL,
     CLIENT_LOOKUP_CSV_URL
   } = keys;
 
   console.log(`🚀 Uploading card ID: ${cardId}`);
   console.log(`🔐 Using API key: ${ADPILER_API_KEY}`);
 
-  // Get Trello card data
   const cardURL = `https://api.trello.com/1/cards/${cardId}?attachments=true&customFieldItems=true&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
   const { data: card } = await axios.get(cardURL);
 
-  // Improved client name extraction
-  const clientName = card.name.toLowerCase().split(/[-:]/)[0].trim();
+  const rawClientName = card.name.split(':')[0].trim().toLowerCase();
   const attachments = card.attachments || [];
 
   console.log(`🧾 Client detected: "${card.name}"`);
   console.log(`📎 Found ${attachments.length} attachments`);
 
-  // Match client ID from sheet
   const { data: csvText } = await axios.get(CLIENT_LOOKUP_CSV_URL);
   const rows = csvText.split('\n').map(r => r.split(','));
-  const clientRow = rows.find(r => r[0].toLowerCase().includes(clientName));
-  if (!clientRow) throw new Error(`Client "${clientName}" not found in sheet.`);
+  const clientRow = rows.find(r => r[0].trim().toLowerCase() === rawClientName);
+
+  if (!clientRow) {
+    console.error(`❌ Error uploading to AdPiler: Client "${card.name}" not found in sheet.`);
+    return;
+  }
+
   const clientId = clientRow[1];
 
-  // Extract metadata from Trello card description
+  const fields = {};
+  for (const item of card.customFieldItems || []) {
+    if (item.value?.text) fields[item.idCustomField] = item.value.text;
+    if (item.value?.checked) fields[item.idCustomField] = item.value.checked;
+  }
+
   const textFallback = (label) =>
     card.desc.split('\n').find(line => line.startsWith(`${label}:`))?.split(':')[1]?.trim();
 
@@ -46,7 +52,6 @@ async function uploadToAdpiler(cardId, keys) {
 
   console.log(`📝 Metadata found:`, metadata);
 
-  // Upload each attachment
   for (const attachment of attachments) {
     const ext = attachment.name.toLowerCase().split('.').pop();
     if (!['png', 'jpg', 'jpeg', 'gif', 'mp4'].includes(ext)) {
@@ -54,12 +59,11 @@ async function uploadToAdpiler(cardId, keys) {
       continue;
     }
 
-    const fileUrl = attachment.url;
     const payload = {
       client_id: clientId,
       name: attachment.name,
       platform: 'social',
-      file_url: fileUrl,
+      file_url: attachment.url,
       headline: metadata.headline,
       description: metadata.description,
       caption: metadata.caption,
@@ -69,7 +73,7 @@ async function uploadToAdpiler(cardId, keys) {
 
     try {
       const response = await axios.post(
-        `${ADPILER_BASE_URL}/creatives`,
+        'https://platform.adpiler.com/api/creatives',
         payload,
         { headers: { 'x-api-key': ADPILER_API_KEY } }
       );
@@ -78,10 +82,9 @@ async function uploadToAdpiler(cardId, keys) {
       console.error(`❌ Failed to upload ${attachment.name}:`, err.response?.data || err.message);
     }
 
-    await delay(500); // avoid rate limiting
+    await delay(500);
   }
 
-  // Apply "Uploaded" label to the card
   const labelResp = await axios.get(
     `https://api.trello.com/1/boards/${card.idBoard}/labels?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`
   );
@@ -99,3 +102,4 @@ async function uploadToAdpiler(cardId, keys) {
 }
 
 module.exports = uploadToAdpiler;
+
