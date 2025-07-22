@@ -30,24 +30,26 @@ async function uploadToAdpiler(cardId, env) {
     );
     const rawAttachments = await attachmentsResp.json();
 
-    if (!rawAttachments.length) {
+    if (!Array.isArray(rawAttachments) || !rawAttachments.length) {
       console.log('📎 No attachments found.');
       return;
     }
 
     console.log(`📦 Retrieved ${rawAttachments.length} raw attachments`);
     rawAttachments.forEach((att, i) => {
-      console.log(`🔍 Attachment ${i + 1}: name="${att.name}", url="${att.url}"`);
+      console.log(`🔍 Attachment ${i + 1}: name="${att?.name}", url="${att?.url}"`);
     });
 
-    // Step 3: Filter attachments with valid extensions and safe URLs
+    // Step 3: Filter attachments
     const validExt = ['.png', '.jpg', '.jpeg', '.gif', '.mp4'];
     const validAttachments = rawAttachments.filter(a => {
-      const name = a.name || '';
-      const ext = path.extname(name).toLowerCase();
+      const ext = path.extname(a?.name || '').toLowerCase();
       return (
+        a &&
+        typeof a === 'object' &&
         typeof a.url === 'string' &&
         a.url.trim().startsWith('https://') &&
+        typeof a.name === 'string' &&
         ext &&
         validExt.includes(ext)
       );
@@ -75,13 +77,17 @@ async function uploadToAdpiler(cardId, env) {
 
     // Step 5: Upload each valid attachment
     for (const [index, attachment] of validAttachments.entries()) {
+      if (!attachment || typeof attachment !== 'object') {
+        console.error(`❌ Skipping: Attachment is not a valid object at index ${index}`);
+        continue;
+      }
+
       const filename = attachment.name;
       const url = attachment.url;
 
       console.log(`📤 Uploading [${index + 1}/${validAttachments.length}]: "${filename}"`);
-      console.log(`🔗 URL: ${url || '[undefined]'}`);
+      console.log(`🔗 URL: "${url || '[undefined]'}"`);
 
-      // Final safety check
       if (
         !url ||
         typeof url !== 'string' ||
@@ -96,7 +102,13 @@ async function uploadToAdpiler(cardId, env) {
       try {
         const fileResp = await fetch(url);
         if (!fileResp.ok) {
-          console.error(`❌ Failed to fetch attachment: ${filename}`);
+          console.error(`❌ Failed to fetch "${filename}" — status: ${fileResp.status}`);
+          continue;
+        }
+
+        const contentType = fileResp.headers.get('content-type') || '';
+        if (!contentType.startsWith('image/') && !contentType.startsWith('video/')) {
+          console.error(`❌ Unexpected content type for "${filename}": ${contentType}`);
           continue;
         }
 
