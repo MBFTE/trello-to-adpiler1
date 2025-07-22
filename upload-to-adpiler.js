@@ -57,7 +57,12 @@ async function uploadToAdpiler(cardId, env) {
 
     for (const attachment of validAttachments) {
       const filename = attachment.name;
-      const url = `https://api.trello.com/1/cards/${cardId}/attachments/${attachment.id}/download?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
+      const url = attachment.url;
+
+      if (!url || !url.startsWith('https://')) {
+        console.error(`❌ Invalid attachment URL for "${filename}"`);
+        continue;
+      }
 
       const fileResp = await fetch(url);
       if (!fileResp.ok) {
@@ -95,4 +100,3 @@ async function uploadToAdpiler(cardId, env) {
 }
 
 module.exports = uploadToAdpiler;
-
