@@ -71,7 +71,9 @@ async function uploadToAdpiler(cardId, env) {
   // 5. Upload to AdPiler
   for (const attachment of validAttachments) {
     const form = new FormData();
-    const fileBuffer = await downloadAttachment(attachment.url, TRELLO_KEY, TRELLO_TOKEN);
+    const downloadUrl = `${attachment.url}?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
+    const fileBuffer = await downloadAttachment(downloadUrl, TRELLO_KEY, TRELLO_TOKEN);
+
 
     form.append('client_id', adpilerClientId);
     form.append('headline', headline);
