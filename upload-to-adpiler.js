@@ -14,8 +14,10 @@ async function uploadToAdpiler(cardId, env) {
     console.log(`🚀 Uploading card ID: ${cardId}`);
     console.log(`🔐 Using API key: ${ADPILER_API_KEY}`);
 
-    // Get card details
-    const cardResp = await fetch(`https://api.trello.com/1/cards/${cardId}?fields=name&attachments=true&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`);
+    // Get card details including attachment URLs
+    const cardResp = await fetch(
+      `https://api.trello.com/1/cards/${cardId}?fields=name&attachments=true&attachment_fields=url,name&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`
+    );
     const card = await cardResp.json();
 
     const cardName = card.name || '';
