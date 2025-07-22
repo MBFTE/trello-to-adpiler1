@@ -68,7 +68,7 @@ async function uploadToAdpiler(cardId, keys) {
 
     try {
       const response = await axios.post(
-        'https://app.adpiler.com/api/creatives',
+        'https://platform.adpiler.com/api/creatives',
         payload,
         { headers: { 'x-api-key': ADPILER_API_KEY } }
       );
