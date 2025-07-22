@@ -1,6 +1,6 @@
 const axios = require('axios');
 const FormData = require('form-data');
-const { parse } = require('csv-parse/sync');
+const { parse } = require('csvtojson');
 
 async function uploadToAdpiler(cardId, config) {
   const { TRELLO_KEY, TRELLO_TOKEN, ADPILER_API_KEY, CLIENT_LOOKUP_CSV_URL } = config;
