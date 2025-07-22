@@ -4,7 +4,7 @@ const bodyParser = require('body-parser');
 const uploadToAdpiler = require('./upload-to-adpiler');
 
 const app = express();
-const PORT = process.env.PORT
+const PORT = process.env.PORT;
 
 app.use(bodyParser.json());
 
@@ -49,6 +49,11 @@ app.get('/', (req, res) => {
   res.send('✅ Trello → AdPiler webhook is running');
 });
 
+app.head('/webhook', (req, res) => {
+  console.log('✅ Trello HEAD verification request received');
+  res.status(200).end();
+});
+
 app.listen(PORT, () => {
   console.log(`🌐 Server running on port ${PORT}`);
   console.log('==> Your service is live 🎉');
@@ -58,12 +63,3 @@ app.listen(PORT, () => {
   console.log('==> ///////////////////////////////////////////////////////////');
 });
 
-
-app.head('/webhook', (req, res) => {
-  console.log('✅ Trello HEAD verification request received');
-  res.status(200).end();
-});
-
-app.listen(PORT, () => {
-  console.log(`🌐 Server running on port ${PORT}`);
-});
