@@ -1,98 +1,72 @@
 const axios = require('axios');
-const csv = require('csvtojson');
 const FormData = require('form-data');
-const path = require('path');
+const csv = require('csvtojson');
 
-const VALID_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.mp4'];
-
-async function downloadAttachment(url, trelloKey, trelloToken) {
+async function downloadAttachment(url) {
   const response = await axios.get(url, {
     responseType: 'arraybuffer',
-    headers: {
-      Authorization: `OAuth oauth_consumer_key="${trelloKey}", oauth_token="${trelloToken}"`
-    }
   });
   return response.data;
 }
 
-async function uploadToAdpiler(cardId, env) {
-  const {
-    TRELLO_KEY,
-    TRELLO_TOKEN,
-    ADPILER_API_KEY,
-    CLIENT_LOOKUP_CSV_URL
-  } = env;
-
-  // 1. Get card info
-  const cardUrl = `https://api.trello.com/1/cards/${cardId}?fields=name,desc,idList&attachments=true&customFieldItems=true&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
-  const card = (await axios.get(cardUrl)).data;
-
+async function uploadToAdpiler(cardId, { TRELLO_KEY, TRELLO_TOKEN, ADPILER_API_KEY, CLIENT_LOOKUP_CSV_URL }) {
   console.log(`🚀 Uploading card ID: ${cardId}`);
   console.log(`🔐 Using API key: ${ADPILER_API_KEY}`);
 
-  const matchKey = card.name.split(':')[0].trim().toLowerCase();
-  console.log(`🧾 Client detected: "${card.name}" → Match Key: "${matchKey}"`);
+  // Get card details
+  const card = await axios.get(`https://api.trello.com/1/cards/${cardId}?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}&attachments=true&fields=name,desc`, {
+    headers: { Accept: 'application/json' },
+  }).then(res => res.data);
 
-  // 2. Lookup AdPiler client ID from CSV
-  const csvData = await axios.get(CLIENT_LOOKUP_CSV_URL);
-  const clientList = await csv().fromString(csvData.data);
-  const clientRow = clientList.find(row => row['Trello Client Name']?.trim().toLowerCase() === matchKey);
+  const cardName = card.name || '';
+  const matchKey = cardName.split(':')[0].trim().toLowerCase();
+  console.log(`🧾 Client detected: "${cardName}" → Match Key: "${matchKey}"`);
 
-  if (!clientRow) {
+  // Parse CSV client sheet
+  const clientsCSV = await axios.get(CLIENT_LOOKUP_CSV_URL).then(res => res.data);
+  const clients = await csv().fromString(clientsCSV);
+  const matchedClient = clients.find(c => (c['Trello Client Name'] || '').toLowerCase().trim() === matchKey);
+
+  if (!matchedClient || !matchedClient['Adpiler Client ID']) {
     throw new Error(`Client "${matchKey}" not found in sheet.`);
   }
 
-  const adpilerClientId = clientRow['AdPiler Client ID'];
-  if (!adpilerClientId) throw new Error(`Missing AdPiler Client ID for "${matchKey}"`);
+  const clientId = matchedClient['Adpiler Client ID'];
 
-  // 3. Extract fields
-  const getCustom = (fieldName) => {
-    const field = card.customFieldItems?.find(item => item.name?.toLowerCase() === fieldName.toLowerCase());
-    return field?.value?.text || '';
-  };
-
-  const headline = getCustom('Headline');
-  const description = getCustom('Description');
-  const caption = getCustom('Primary Text') || getCustom('Caption');
-  const cta = getCustom('CTA') || '';
-  const clickUrl = getCustom('Click Through URL') || '';
-
-  // 4. Get valid attachments
-  const attachments = card.attachments || [];
-  const validAttachments = attachments.filter(att => {
-    const ext = path.extname(att.name || '').toLowerCase();
-    return VALID_EXTENSIONS.includes(ext);
+  const attachments = (card.attachments || []).filter(att => {
+    const ext = att.name.split('.').pop().toLowerCase();
+    return ['png', 'jpg', 'jpeg', 'gif', 'mp4'].includes(ext);
   });
 
-  console.log(`📎 Found ${validAttachments.length} attachments`);
+  console.log(`📎 Found ${attachments.length} attachments`);
 
-  if (validAttachments.length === 0) throw new Error('No valid creative attachments found');
+  if (attachments.length === 0) {
+    throw new Error('No valid attachments to upload.');
+  }
 
-  // 5. Upload to AdPiler
-  for (const attachment of validAttachments) {
-    const form = new FormData();
-    const downloadUrl = `${attachment.url}?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
-    const fileBuffer = await downloadAttachment(downloadUrl, TRELLO_KEY, TRELLO_TOKEN);
-
-
-    form.append('client_id', adpilerClientId);
-    form.append('headline', headline);
-    form.append('description', description);
-    form.append('caption', caption);
-    form.append('cta', cta);
-    form.append('click_url', clickUrl);
-    form.append('file', fileBuffer, attachment.name);
-
+  // Upload each attachment to AdPiler
+  for (const attachment of attachments) {
     try {
-      const response = await axios.post('https://app.adpiler.com/api/upload/', form, {
+      const downloadUrl = `${attachment.url}?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
+      const fileBuffer = await downloadAttachment(downloadUrl);
+
+      const form = new FormData();
+      form.append('client_id', clientId);
+      form.append('creative_file', fileBuffer, attachment.name);
+      form.append('headline', card.name);
+      form.append('description', card.desc || '');
+      form.append('platform', 'social');
+
+      const res = await axios.post('https://platform.adpiler.com/api/creatives', form, {
         headers: {
           ...form.getHeaders(),
-          Authorization: `Bearer ${ADPILER_API_KEY}`
-        }
+          'x-api-key': ADPILER_API_KEY,
+        },
       });
-      console.log(`✅ Uploaded: ${attachment.name} → AdPiler ID: ${response.data?.id || '[unknown]'}`);
+
+      console.log(`✅ Uploaded: ${attachment.name} (ID: ${res.data?.id || 'unknown'})`);
     } catch (err) {
-      console.error(`❌ Upload error: ${attachment.name}`, err.response?.data || err.message);
+      console.error(`❌ Upload error for ${attachment.name}:`, err.message || err);
     }
   }
 }
