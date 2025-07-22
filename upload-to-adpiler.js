@@ -14,9 +14,9 @@ async function uploadToAdpiler(cardId, env) {
     console.log(`🚀 Uploading card ID: ${cardId}`);
     console.log(`🔐 Using API key: ${ADPILER_API_KEY}`);
 
-    // Get card details including attachment URLs
+    // Step 1: Get card metadata
     const cardResp = await fetch(
-      `https://api.trello.com/1/cards/${cardId}?fields=name&attachments=true&attachment_fields=url,name&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`
+      `https://api.trello.com/1/cards/${cardId}?fields=name&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`
     );
     const card = await cardResp.json();
 
@@ -24,7 +24,12 @@ async function uploadToAdpiler(cardId, env) {
     const matchKey = cardName.split(':')[0]?.trim().toLowerCase();
     console.log(`🧾 Client detected: "${cardName}" → Match Key: "${matchKey}"`);
 
-    const attachments = card.attachments || [];
+    // Step 2: Get full attachment data
+    const attachmentsResp = await fetch(
+      `https://api.trello.com/1/cards/${cardId}/attachments?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`
+    );
+    const attachments = await attachmentsResp.json();
+
     if (!attachments.length) {
       console.log('📎 No attachments found.');
       return;
@@ -54,7 +59,7 @@ async function uploadToAdpiler(cardId, env) {
       validExt.includes(path.extname(a.name || '').toLowerCase())
     );
 
-    console.log(`📎 Found ${validAttachments.length} attachments`);
+    console.log(`📎 Found ${validAttachments.length} valid attachments`);
 
     for (const attachment of validAttachments) {
       const filename = attachment.name;
@@ -101,3 +106,4 @@ async function uploadToAdpiler(cardId, env) {
 }
 
 module.exports = uploadToAdpiler;
+
