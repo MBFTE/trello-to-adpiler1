@@ -2,6 +2,19 @@ const FormData = require('form-data');
 const csv = require('csvtojson');
 const path = require('path');
 
+async function fetchAttachmentMetadata(cardId, attachmentId, key, token) {
+  const metadataResp = await fetch(
+    `https://api.trello.com/1/cards/${cardId}/attachments/${attachmentId}?key=${key}&token=${token}`,
+    { headers: { 'Accept': 'application/json' } }
+  );
+  if (!metadataResp.ok) {
+    console.error(`⚠️ Failed to fetch metadata for attachment ID ${attachmentId} — status ${metadataResp.status}`);
+    return null;
+  }
+  const metadata = await metadataResp.json();
+  return metadata;
+}
+
 async function uploadToAdpiler(cardId, env) {
   const {
     TRELLO_KEY,
@@ -14,17 +27,16 @@ async function uploadToAdpiler(cardId, env) {
     console.log(`🚀 Uploading card ID: ${cardId}`);
     console.log(`🔐 Using API key: ${ADPILER_API_KEY}`);
 
-    // Step 1: Get card metadata
+    // Step 1: Card metadata
     const cardResp = await fetch(
       `https://api.trello.com/1/cards/${cardId}?fields=name&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`
     );
     const card = await cardResp.json();
-
     const cardName = card.name || '';
     const matchKey = cardName.split(':')[0]?.trim().toLowerCase();
     console.log(`🧾 Client detected: "${cardName}" → Match Key: "${matchKey}"`);
 
-    // Step 2: Get attachments
+    // Step 2: Raw attachments
     const attachmentsResp = await fetch(
       `https://api.trello.com/1/cards/${cardId}/attachments?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`
     );
@@ -35,59 +47,54 @@ async function uploadToAdpiler(cardId, env) {
       return;
     }
 
-    console.log(`📦 Retrieved ${rawAttachments.length} raw attachments`);
-    rawAttachments.forEach((att, i) => {
-      console.log(`🔍 Attachment ${i + 1}: name="${att.name}", url="${att.url}", isUpload=${att.isUpload}`);
-    });
-
-    // Step 3: Filter and prepare uploadable attachments
+    console.log(`📦 Retrieved ${rawAttachments.length} attachments`);
     const validExt = ['.png', '.jpg', '.jpeg', '.gif', '.mp4'];
     const uploadQueue = [];
 
-    for (const attachment of rawAttachments) {
-      const ext = path.extname(attachment?.name || '').toLowerCase();
-
-      if (
-        !attachment ||
-        typeof attachment !== 'object' ||
-        !attachment.name ||
-        !validExt.includes(ext)
-      ) {
-        console.log(`⚠️ Skipping invalid or unsupported file: ${attachment.name}`);
+    for (const att of rawAttachments) {
+      const ext = path.extname(att?.name || '').toLowerCase();
+      if (!att || !att.name || !validExt.includes(ext)) {
+        console.log(`⚠️ Skipping unsupported file: ${att.name}`);
         continue;
       }
 
       let url = null;
 
-      if (!attachment.isUpload) {
-        // Use link-style attachment URL directly
-        url = attachment.url;
+      if (!att.isUpload) {
+        url = att.url;
       } else {
-        // Build download URL from attachment ID using Trello's authenticated API
-        url = `https://api.trello.com/1/cards/${cardId}/attachments/${attachment.id}/download?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
+        if (!att.id) {
+          console.log(`⚠️ Skipping: Missing attachment ID for "${att.name}"`);
+          continue;
+        }
+
+        const metadata = await fetchAttachmentMetadata(cardId, att.id, TRELLO_KEY, TRELLO_TOKEN);
+        if (!metadata || !metadata.id || !metadata.name) {
+          console.log(`⚠️ Skipping: Invalid metadata for "${att.name}"`);
+          continue;
+        }
+
+        console.log(`📑 Metadata: "${metadata.name}" | mimeType="${metadata.mimeType}" | bytes="${metadata.bytes}"`);
+        url = `https://api.trello.com/1/cards/${cardId}/attachments/${att.id}/download?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
       }
 
       if (!url || typeof url !== 'string' || !url.startsWith('http')) {
-        console.log(`⚠️ Skipping attachment with bad URL: ${attachment.name}`);
+        console.log(`⚠️ Skipping invalid URL for "${att.name}" → "${url}"`);
         continue;
       }
 
-      uploadQueue.push({ name: attachment.name, url });
+      uploadQueue.push({ name: att.name, url });
     }
 
     console.log(`✅ Prepared ${uploadQueue.length} attachments for upload`);
 
-    // Step 4: Get client lookup info
+    // Step 3: Client mapping
     const clientCSVResp = await fetch(CLIENT_LOOKUP_CSV_URL);
     const clientCSVText = await clientCSVResp.text();
     const clients = await csv().fromString(clientCSVText);
-
-    const clientMatch = clients.find(c =>
-      (c['Trello Client Name'] || '').toLowerCase().trim() === matchKey
-    );
-
+    const clientMatch = clients.find(c => (c['Trello Client Name'] || '').toLowerCase().trim() === matchKey);
     if (!clientMatch) {
-      console.error(`❌ Upload failed: Client "${matchKey}" not found in sheet.`);
+      console.error(`❌ Upload failed: Client "${matchKey}" not found`);
       return;
     }
 
@@ -95,11 +102,10 @@ async function uploadToAdpiler(cardId, env) {
     const campaignId = clientMatch['Adpiler Campaign ID'];
     console.log(`🎯 Client matched: ID=${clientId}, Campaign=${campaignId}`);
 
-    // Step 5: Upload each item
+    // Step 4: Upload loop
     for (const [index, item] of uploadQueue.entries()) {
       const filename = item.name;
       const url = item.url;
-
       console.log(`📤 Uploading [${index + 1}/${uploadQueue.length}]: "${filename}"`);
       console.log(`🔗 URL: "${url}"`);
 
@@ -117,7 +123,6 @@ async function uploadToAdpiler(cardId, env) {
         }
 
         const fileBuffer = await fileResp.arrayBuffer();
-
         const form = new FormData();
         form.append('client_id', clientId);
         form.append('campaign_id', campaignId);
@@ -126,9 +131,7 @@ async function uploadToAdpiler(cardId, env) {
 
         const uploadResp = await fetch('https://app.adpiler.com/api/creatives', {
           method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${ADPILER_API_KEY}`
-          },
+          headers: { 'Authorization': `Bearer ${ADPILER_API_KEY}` },
           body: form
         });
 
@@ -140,7 +143,7 @@ async function uploadToAdpiler(cardId, env) {
           console.error(`❌ Error uploading "${filename}": ${result.message || JSON.stringify(result)}`);
         }
       } catch (err) {
-        console.error(`❌ Exception during upload of "${filename}": ${err.message || err}`);
+        console.error(`❌ Upload error for "${filename}": ${err.message || err}`);
       }
     }
   } catch (err) {
