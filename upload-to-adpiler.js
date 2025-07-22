@@ -24,38 +24,37 @@ async function uploadToAdpiler(cardId, env) {
     const matchKey = cardName.split(':')[0]?.trim().toLowerCase();
     console.log(`🧾 Client detected: "${cardName}" → Match Key: "${matchKey}"`);
 
-    // Step 2: Get attachments
+    // Step 2: Fetch full attachments using Trello's endpoint
     const attachmentsResp = await fetch(
       `https://api.trello.com/1/cards/${cardId}/attachments?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`
     );
-    const rawAttachments = await attachmentsResp.json();
+    const attachments = await attachmentsResp.json();
 
-    if (!Array.isArray(rawAttachments) || !rawAttachments.length) {
+    if (!Array.isArray(attachments) || !attachments.length) {
       console.log('📎 No attachments found.');
       return;
     }
 
-    console.log(`📦 Retrieved ${rawAttachments.length} raw attachments`);
-    rawAttachments.forEach((att, i) => {
-      console.log(`🔍 Attachment ${i + 1}: name="${att?.name}", url="${att?.url}"`);
+    console.log(`📦 Retrieved ${attachments.length} attachments`);
+    attachments.forEach((att, i) => {
+      console.log(`🔍 Attachment ${i + 1}: name="${att.name}", url="${att.url}"`);
     });
 
-    // Step 3: Filter attachments
+    // Step 3: Filter attachments using only public URLs
     const validExt = ['.png', '.jpg', '.jpeg', '.gif', '.mp4'];
-    const validAttachments = rawAttachments.filter(a => {
+    const validAttachments = attachments.filter(a => {
       const ext = path.extname(a?.name || '').toLowerCase();
       return (
-        a &&
         typeof a === 'object' &&
         typeof a.url === 'string' &&
-        a.url.trim().startsWith('https://') &&
-        typeof a.name === 'string' &&
+        a.url.includes('trello-attachments.s3') &&
+        a.url.startsWith('https://') &&
         ext &&
         validExt.includes(ext)
       );
     });
 
-    console.log(`✅ Found ${validAttachments.length} valid attachments`);
+    console.log(`✅ Found ${validAttachments.length} publicly accessible attachments`);
 
     // Step 4: Get client mapping
     const clientCSVResp = await fetch(CLIENT_LOOKUP_CSV_URL);
@@ -75,29 +74,13 @@ async function uploadToAdpiler(cardId, env) {
     const campaignId = clientMatch['Adpiler Campaign ID'];
     console.log(`🎯 Client matched: ID=${clientId}, Campaign=${campaignId}`);
 
-    // Step 5: Upload each valid attachment
+    // Step 5: Upload each valid public attachment
     for (const [index, attachment] of validAttachments.entries()) {
-      if (!attachment || typeof attachment !== 'object') {
-        console.error(`❌ Skipping: Attachment is not a valid object at index ${index}`);
-        continue;
-      }
-
       const filename = attachment.name;
       const url = attachment.url;
 
       console.log(`📤 Uploading [${index + 1}/${validAttachments.length}]: "${filename}"`);
-      console.log(`🔗 URL: "${url || '[undefined]'}"`);
-
-      if (
-        !url ||
-        typeof url !== 'string' ||
-        url.trim() === '' ||
-        url === 'undefined' ||
-        !url.startsWith('http')
-      ) {
-        console.error(`❌ Skipping upload: Bad URL for "${filename}" → "${url}"`);
-        continue;
-      }
+      console.log(`🔗 URL: "${url}"`);
 
       try {
         const fileResp = await fetch(url);
