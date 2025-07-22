@@ -79,7 +79,12 @@ async function uploadToAdpiler(cardId, env) {
       const filename = attachment.name;
       const url = attachment.url;
 
-      console.log(`📤 Attempting upload: name="${filename}", url="${url}"`);
+      console.log(`📤 Attempting upload: name="${filename}", url="${url || 'undefined'}"`);
+
+      if (!url || typeof url !== 'string' || !url.startsWith('https://')) {
+        console.error(`❌ Skipping upload: Invalid or undefined URL for "${filename}"`);
+        continue;
+      }
 
       try {
         const fileResp = await fetch(url);
@@ -121,4 +126,3 @@ async function uploadToAdpiler(cardId, env) {
 }
 
 module.exports = uploadToAdpiler;
-
