@@ -1,48 +1,51 @@
 const express = require('express');
 const bodyParser = require('body-parser');
+const uploadToAdpiler = require('./upload-to-adpiler');
+require('dotenv').config();
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(bodyParser.json());
 
-// Health check route
-app.get('/', (req, res) => {
-  res.send('🚀 Trello to AdPiler webhook is live');
-});
+const TRELLO_KEY = process.env.TRELLO_KEY;
+const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
+const ADPILER_API_KEY = process.env.ADPILER_API_KEY;
+const CLIENT_LOOKUP_CSV_URL = process.env.CLIENT_LOOKUP_CSV_URL;
 
-// Trello webhook verification (HEAD)
 app.head('/webhook', (req, res) => {
   console.log('✅ Trello HEAD verification request received');
   res.sendStatus(200);
 });
 
-// Trello webhook listener (POST)
-app.post('/webhook', (req, res) => {
+app.post('/webhook', async (req, res) => {
   const action = req.body.action;
-  console.log('📬 Webhook triggered from Trello');
-  console.log(JSON.stringify(action, null, 2));
 
-  // Basic example: detect movement into "Ready For Adpiler"
   if (
     action &&
     action.type === 'updateCard' &&
-    action.data &&
-    action.data.listAfter &&
-    action.data.listAfter.name === 'Ready For Adpiler'
+    action.data?.listAfter?.name === 'Ready For Adpiler'
   ) {
     const cardId = action.data.card.id;
-    const cardName = action.data.card.name;
-    console.log(`🎯 Card "${cardName}" moved to Ready For Adpiler (ID: ${cardId})`);
-
-    // 🔁 Insert your AdPiler API call here
-    // uploadToAdpiler(cardId, cardName); // You'll define this later
+    try {
+      await uploadToAdpiler(cardId, {
+        TRELLO_KEY,
+        TRELLO_TOKEN,
+        ADPILER_API_KEY,
+        CLIENT_LOOKUP_CSV_URL
+      });
+    } catch (err) {
+      console.error(`❌ Error uploading to AdPiler:`, err.message);
+    }
   }
 
   res.sendStatus(200);
 });
 
-// Start the server
+app.get('/', (req, res) => {
+  res.send('🚀 Trello to AdPiler webhook is live');
+});
+
 app.listen(PORT, () => {
   console.log(`🌐 Server running on port ${PORT}`);
 });
