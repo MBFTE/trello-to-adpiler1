@@ -176,4 +176,3 @@ async function uploadToAdpiler(cardId, env) {
 }
 
 module.exports = uploadToAdpiler;
-
