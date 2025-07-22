@@ -24,18 +24,32 @@ async function uploadToAdpiler(cardId, env) {
     const matchKey = cardName.split(':')[0]?.trim().toLowerCase();
     console.log(`🧾 Client detected: "${cardName}" → Match Key: "${matchKey}"`);
 
-    // Step 2: Get full attachment data
+    // Step 2: Get attachments
     const attachmentsResp = await fetch(
       `https://api.trello.com/1/cards/${cardId}/attachments?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`
     );
-    const attachments = await attachmentsResp.json();
+    const rawAttachments = await attachmentsResp.json();
 
-    if (!attachments.length) {
+    if (!rawAttachments.length) {
       console.log('📎 No attachments found.');
       return;
     }
 
-    // Get client lookup table
+    console.log(`📦 Retrieved ${rawAttachments.length} raw attachments`);
+    rawAttachments.forEach((att, i) => {
+      console.log(`🔍 Attachment ${i + 1}: name="${att.name}", url="${att.url}"`);
+    });
+
+    // Filter attachments with valid image/video extensions AND valid URL
+    const validExt = ['.png', '.jpg', '.jpeg', '.gif', '.mp4'];
+    const validAttachments = rawAttachments.filter(a => {
+      const ext = path.extname(a.name || '').toLowerCase();
+      return a.url && a.url.startsWith('https://') && validExt.includes(ext);
+    });
+
+    console.log(`✅ Found ${validAttachments.length} valid attachments`);
+
+    // Step 3: Get client lookup
     const clientCSVResp = await fetch(CLIENT_LOOKUP_CSV_URL);
     const clientCSVText = await clientCSVResp.text();
     const clients = await csv().fromString(clientCSVText);
@@ -51,53 +65,45 @@ async function uploadToAdpiler(cardId, env) {
 
     const clientId = clientMatch['Adpiler Client ID'];
     const campaignId = clientMatch['Adpiler Campaign ID'];
-    console.log(`✅ Client matched: ID=${clientId}, Campaign=${campaignId}`);
+    console.log(`🎯 Client matched: ID=${clientId}, Campaign=${campaignId}`);
 
-    // Filter valid attachments
-    const validExt = ['.png', '.jpg', '.jpeg', '.gif', '.mp4'];
-    const validAttachments = attachments.filter(a =>
-      validExt.includes(path.extname(a.name || '').toLowerCase())
-    );
-
-    console.log(`📎 Found ${validAttachments.length} valid attachments`);
-
+    // Step 4: Upload each valid attachment
     for (const attachment of validAttachments) {
       const filename = attachment.name;
       const url = attachment.url;
 
-      if (!url || !url.startsWith('https://')) {
-        console.error(`❌ Invalid attachment URL for "${filename}"`);
-        continue;
-      }
+      try {
+        const fileResp = await fetch(url);
+        if (!fileResp.ok) {
+          console.error(`❌ Failed to fetch attachment: ${filename}`);
+          continue;
+        }
 
-      const fileResp = await fetch(url);
-      if (!fileResp.ok) {
-        console.error(`❌ Failed to fetch attachment: ${filename}`);
-        continue;
-      }
+        const fileBuffer = await fileResp.arrayBuffer();
 
-      const fileBuffer = await fileResp.arrayBuffer();
+        const form = new FormData();
+        form.append('client_id', clientId);
+        form.append('campaign_id', campaignId);
+        form.append('name', filename);
+        form.append('file', Buffer.from(fileBuffer), { filename });
 
-      const form = new FormData();
-      form.append('client_id', clientId);
-      form.append('campaign_id', campaignId);
-      form.append('name', filename);
-      form.append('file', Buffer.from(fileBuffer), { filename });
+        const uploadResp = await fetch('https://app.adpiler.com/api/creatives', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${ADPILER_API_KEY}`
+          },
+          body: form
+        });
 
-      const uploadResp = await fetch('https://app.adpiler.com/api/creatives', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${ADPILER_API_KEY}`
-        },
-        body: form
-      });
+        const result = await uploadResp.json();
 
-      const result = await uploadResp.json();
-
-      if (uploadResp.ok) {
-        console.log(`✅ Uploaded "${filename}" to AdPiler`);
-      } else {
-        console.error(`❌ Error uploading "${filename}" to AdPiler: ${result.message || JSON.stringify(result)}`);
+        if (uploadResp.ok) {
+          console.log(`✅ Uploaded "${filename}" to AdPiler`);
+        } else {
+          console.error(`❌ Error uploading "${filename}": ${result.message || JSON.stringify(result)}`);
+        }
+      } catch (uploadError) {
+        console.error(`❌ Exception during upload of "${filename}": ${uploadError.message || uploadError}`);
       }
     }
   } catch (err) {
@@ -106,4 +112,5 @@ async function uploadToAdpiler(cardId, env) {
 }
 
 module.exports = uploadToAdpiler;
+
 
