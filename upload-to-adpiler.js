@@ -40,16 +40,23 @@ async function uploadToAdpiler(cardId, env) {
       console.log(`🔍 Attachment ${i + 1}: name="${att.name}", url="${att.url}"`);
     });
 
-    // Filter attachments with valid image/video extensions AND valid URL
+    // Step 3: Filter attachments with valid extensions and safe URLs
     const validExt = ['.png', '.jpg', '.jpeg', '.gif', '.mp4'];
     const validAttachments = rawAttachments.filter(a => {
-      const ext = path.extname(a.name || '').toLowerCase();
-      return a.url && a.url.startsWith('https://') && validExt.includes(ext);
+      const name = a.name || '';
+      const ext = path.extname(name).toLowerCase();
+      return (
+        a.url &&
+        typeof a.url === 'string' &&
+        a.url.startsWith('https://') &&
+        ext &&
+        validExt.includes(ext)
+      );
     });
 
     console.log(`✅ Found ${validAttachments.length} valid attachments`);
 
-    // Step 3: Get client lookup
+    // Step 4: Get client mapping
     const clientCSVResp = await fetch(CLIENT_LOOKUP_CSV_URL);
     const clientCSVText = await clientCSVResp.text();
     const clients = await csv().fromString(clientCSVText);
@@ -67,10 +74,12 @@ async function uploadToAdpiler(cardId, env) {
     const campaignId = clientMatch['Adpiler Campaign ID'];
     console.log(`🎯 Client matched: ID=${clientId}, Campaign=${campaignId}`);
 
-    // Step 4: Upload each valid attachment
+    // Step 5: Upload each valid attachment
     for (const attachment of validAttachments) {
       const filename = attachment.name;
       const url = attachment.url;
+
+      console.log(`📤 Attempting upload: name="${filename}", url="${url}"`);
 
       try {
         const fileResp = await fetch(url);
@@ -112,5 +121,4 @@ async function uploadToAdpiler(cardId, env) {
 }
 
 module.exports = uploadToAdpiler;
-
 
