@@ -7,7 +7,7 @@ function isValidTrelloId(id) {
   return typeof id === 'string' && /^[0-9a-fA-F]{24}$/.test(id);
 }
 
-// 📑 Fetch metadata for one attachment
+// 📑 Trello Metadata Fetch
 async function fetchAttachmentMetadata(cardId, attachmentId, key, token) {
   if (!isValidTrelloId(cardId) || !isValidTrelloId(attachmentId)) {
     console.warn(`⚠️ Invalid Trello ID → card="${cardId}" attachment="${attachmentId}"`);
@@ -30,21 +30,20 @@ async function fetchAttachmentMetadata(cardId, attachmentId, key, token) {
   }
 }
 
-// 🚀 Upload function
 async function uploadToAdpiler(cardId, env) {
   const { TRELLO_KEY, TRELLO_TOKEN, ADPILER_API_KEY, CLIENT_LOOKUP_CSV_URL } = env;
 
   try {
     console.log(`🚀 Uploading card ID: ${cardId}`);
 
-    // Card name and match key
+    // 1️⃣ Fetch card metadata
     const cardRes = await fetch(`https://api.trello.com/1/cards/${cardId}?fields=name&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`);
     const card = await cardRes.json();
     const cardName = card?.name || '';
     const matchKey = cardName.split(':')[0]?.trim().toLowerCase();
     console.log(`🧾 Client detected: "${cardName}" → Match Key: "${matchKey}"`);
 
-    // Get attachments
+    // 2️⃣ Retrieve attachments
     const attRes = await fetch(`https://api.trello.com/1/cards/${cardId}/attachments?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`);
     const rawAttachments = await attRes.json();
 
@@ -60,7 +59,7 @@ async function uploadToAdpiler(cardId, env) {
     for (const att of rawAttachments) {
       const ext = path.extname(att?.name || '').toLowerCase();
       if (!att?.name || !validExt.includes(ext)) {
-        console.log(`⚠️ Skipping unsupported or unnamed attachment: ${att.name}`);
+        console.log(`⚠️ Skipping unsupported attachment: ${att.name}`);
         continue;
       }
 
@@ -95,13 +94,13 @@ async function uploadToAdpiler(cardId, env) {
     console.log(`✅ Prepared ${uploadQueue.length} attachments for upload`);
     console.log(`🧾 Final uploadQueue:`, JSON.stringify(uploadQueue, null, 2));
 
-    // Client match
+    // 3️⃣ Client match
     const csvRes = await fetch(CLIENT_LOOKUP_CSV_URL);
     const csvText = await csvRes.text();
     const clients = await csv().fromString(csvText);
     const clientMatch = clients.find(c => (c['Trello Client Name'] || '').toLowerCase().trim() === matchKey);
     if (!clientMatch) {
-      console.error(`❌ Upload failed: Client "${matchKey}" not found`);
+      console.error(`❌ Client "${matchKey}" not found`);
       return;
     }
 
@@ -109,17 +108,24 @@ async function uploadToAdpiler(cardId, env) {
     const campaignId = clientMatch['Adpiler Campaign ID'];
     console.log(`🎯 Client matched: ID=${clientId}, Campaign=${campaignId}`);
 
-    // Upload loop
+    // 4️⃣ Upload loop
     for (const [index, item] of uploadQueue.entries()) {
       const { name, url } = item;
 
-      if (!name || typeof name !== 'string' || !url || typeof url !== 'string' || url.trim() === '' || url.includes('undefined')) {
-        console.error(`❌ Skipping bad upload item: name="${name}", url="${url}"`);
+      if (!name || typeof name !== 'string' || !url || typeof url !== 'string' || url.includes('undefined')) {
+        console.error(`❌ Skipping upload: Invalid name/url — name="${name}", url="${url}"`);
         continue;
       }
 
-      console.log(`📤 Uploading [${index + 1}/${uploadQueue.length}]: "${name}"`);
-      console.log(`🔗 URL: "${url}"`);
+      try {
+        // 🧭 Sanity check for URL parsing
+        const parsedURL = new URL(url);
+        console.log(`📤 Uploading [${index + 1}/${uploadQueue.length}]: "${name}"`);
+        console.log(`🔗 Parsed URL: "${parsedURL.href}"`);
+      } catch (parseErr) {
+        console.error(`❌ URL parse failed for "${name}": ${parseErr.message}`);
+        continue;
+      }
 
       try {
         const fileRes = await fetch(url);
@@ -136,16 +142,11 @@ async function uploadToAdpiler(cardId, env) {
 
         const fileBuffer = await fileRes.arrayBuffer();
         if (!fileBuffer || fileBuffer.byteLength === 0) {
-          console.error(`❌ Empty or invalid buffer for "${name}"`);
+          console.error(`❌ Buffer is empty for "${name}"`);
           continue;
         }
 
-        console.log(`📦 Form content for "${name}":`, {
-          name,
-          client_id: clientId,
-          campaign_id: campaignId,
-          file_bytes: fileBuffer.byteLength
-        });
+        console.log(`📦 Preparing form for "${name}": ${fileBuffer.byteLength} bytes`);
 
         const form = new FormData();
         form.append('client_id', clientId);
@@ -164,7 +165,7 @@ async function uploadToAdpiler(cardId, env) {
             body: form
           });
         } catch (uploadErr) {
-          console.error(`❌ Fetch error to AdPiler for "${name}": ${uploadErr.message}`);
+          console.error(`❌ AdPiler fetch error for "${name}": ${uploadErr.message}`);
           continue;
         }
 
@@ -177,12 +178,12 @@ async function uploadToAdpiler(cardId, env) {
         }
 
         if (uploadRes.ok) {
-          console.log(`✅ Uploaded "${name}" successfully`);
+          console.log(`✅ Uploaded "${name}"`);
         } else {
-          console.error(`❌ AdPiler error for "${name}": ${result.message || JSON.stringify(result)}`);
+          console.error(`❌ AdPiler upload failed for "${name}": ${result.message || JSON.stringify(result)}`);
         }
       } catch (err) {
-        console.error(`❌ Exception during upload of "${name}": ${err.message}`);
+        console.error(`❌ Upload exception for "${name}": ${err.message}`);
       }
     }
   } catch (err) {
@@ -191,3 +192,4 @@ async function uploadToAdpiler(cardId, env) {
 }
 
 module.exports = uploadToAdpiler;
+
