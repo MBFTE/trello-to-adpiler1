@@ -11,6 +11,7 @@ async function uploadToAdpiler(cardId, keys) {
   } = keys;
 
   console.log(`🚀 Uploading card ID: ${cardId}`);
+  console.log("🔐 Using API key:", ADPILER_API_KEY);
 
   const cardURL = `https://api.trello.com/1/cards/${cardId}?attachments=true&customFieldItems=true&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
   const { data: card } = await axios.get(cardURL);
