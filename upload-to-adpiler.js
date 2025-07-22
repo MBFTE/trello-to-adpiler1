@@ -1,4 +1,3 @@
-const fetch = require('node-fetch');
 const FormData = require('form-data');
 const csv = require('csvtojson');
 const path = require('path');
@@ -70,13 +69,13 @@ async function uploadToAdpiler(cardId, env) {
         continue;
       }
 
-      const fileBuffer = await fileResp.buffer();
+      const fileBuffer = await fileResp.arrayBuffer();
 
       const form = new FormData();
       form.append('client_id', clientId);
       form.append('campaign_id', campaignId);
       form.append('name', filename);
-      form.append('file', fileBuffer, { filename });
+      form.append('file', Buffer.from(fileBuffer), { filename });
 
       const uploadResp = await fetch('https://app.adpiler.com/api/creatives', {
         method: 'POST',
