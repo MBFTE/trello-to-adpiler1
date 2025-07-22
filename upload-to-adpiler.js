@@ -96,13 +96,3 @@ async function uploadToAdpiler(cardId, env) {
 }
 
 module.exports = uploadToAdpiler;
-
-
-      console.log(`✅ Uploaded: ${file.name}`);
-    } catch (err) {
-      console.error(`❌ Upload error for ${file.name}:`, err.message);
-    }
-  }
-}
-
-module.exports = uploadToAdpiler;
