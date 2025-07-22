@@ -4,7 +4,7 @@ const bodyParser = require('body-parser');
 const uploadToAdpiler = require('./upload-to-adpiler');
 
 const app = express();
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT
 
 app.use(bodyParser.json());
 
