@@ -1,16 +1,16 @@
 {
   "name": "trello-to-adpiler",
   "version": "1.0.0",
-  "description": "Automated Trello to AdPiler uploader",
+  "description": "Webhook server to upload Trello card attachments to AdPiler",
   "main": "server.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "axios": "^1.6.0",
+    "axios": "^1.6.8",
     "body-parser": "^1.20.2",
-    "dotenv": "^16.3.1",
-    "express": "^4.18.2"
+    "csvtojson": "^2.0.10",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
   }
 }
