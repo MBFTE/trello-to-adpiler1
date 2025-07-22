@@ -46,9 +46,8 @@ async function uploadToAdpiler(cardId, env) {
       const name = a.name || '';
       const ext = path.extname(name).toLowerCase();
       return (
-        a.url &&
         typeof a.url === 'string' &&
-        a.url.startsWith('https://') &&
+        a.url.trim().startsWith('https://') &&
         ext &&
         validExt.includes(ext)
       );
@@ -75,14 +74,22 @@ async function uploadToAdpiler(cardId, env) {
     console.log(`🎯 Client matched: ID=${clientId}, Campaign=${campaignId}`);
 
     // Step 5: Upload each valid attachment
-    for (const attachment of validAttachments) {
+    for (const [index, attachment] of validAttachments.entries()) {
       const filename = attachment.name;
       const url = attachment.url;
 
-      console.log(`📤 Attempting upload: name="${filename}", url="${url || 'undefined'}"`);
+      console.log(`📤 Uploading [${index + 1}/${validAttachments.length}]: "${filename}"`);
+      console.log(`🔗 URL: ${url || '[undefined]'}`);
 
-      if (!url || typeof url !== 'string' || !url.startsWith('https://')) {
-        console.error(`❌ Skipping upload: Invalid or undefined URL for "${filename}"`);
+      // Final safety check
+      if (
+        !url ||
+        typeof url !== 'string' ||
+        url.trim() === '' ||
+        url === 'undefined' ||
+        !url.startsWith('http')
+      ) {
+        console.error(`❌ Skipping upload: Bad URL for "${filename}" → "${url}"`);
         continue;
       }
 
