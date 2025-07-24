@@ -14,7 +14,10 @@ async function getClientMapping(cardName) {
   const csvText = await response.text();
   const clients = await csv().fromString(csvText);
 
-  const match = clients.find(c => c["Trello Client Name"]?.trim() === cardName.trim());
+  const match = clients.find(c =>
+    cardName.toLowerCase().startsWith((c["Trello Client Name"] || "").toLowerCase())
+  );
+
   if (!match) return null;
 
   return {
