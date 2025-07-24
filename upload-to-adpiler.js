@@ -26,29 +26,25 @@ async function getClientMapping(cardName) {
   };
 }
 
-function extractTypeAndNetworkFromLabels(labels, cardName) {
+function extractLabelMetadata(labels, cardName) {
   const labelNames = labels.map(l => l.name?.toLowerCase() || "");
 
   if (labelNames.includes("social")) {
-    const isCarousel = cardName.toLowerCase().includes("carousel");
     return {
-      network: "facebook",
-      type: isCarousel ? "carousel" : "image"
+      type: "post",
+      network: "facebook"
     };
   }
 
   if (labelNames.includes("display")) {
-    return {
-      network: "google",
-      type: "image"
-    };
+    return {}; // Display campaigns don’t require type/network
   }
 
   return null;
 }
 
 async function getCardDetails(cardId) {
-  const url = `https://api.trello.com/1/cards/${cardId}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}&fields=name,desc,url,labels`;
+  const url = `https://api.trello.com/1/cards/${cardId}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}&fields=name,desc,url&attachments=true&labels=true`;
   const response = await fetch(url);
   if (!response.ok) throw new Error("Failed to fetch card details");
   return await response.json();
@@ -63,9 +59,8 @@ async function uploadToAdpiler(card, attachments) {
     console.log(`📁 AdPiler Folder ID (Campaign ID): ${mapping.folderId}`);
 
     const cardDetails = await getCardDetails(card.id);
-    const labelMetadata = extractTypeAndNetworkFromLabels(cardDetails.labels || [], card.name);
-
-    if (!labelMetadata) throw new Error(`Card "${card.name}" missing 'Social' or 'Display' label.`);
+    const labelMeta = extractLabelMetadata(cardDetails.labels || [], card.name);
+    if (!labelMeta) throw new Error(`Card "${card.name}" missing 'Social' or 'Display' label.`);
 
     const metadata = {
       primaryText: cardDetails.desc || "",
@@ -87,11 +82,11 @@ async function uploadToAdpiler(card, attachments) {
       form.append('name', attachment.name);
       form.append('image', buffer, attachment.name);
 
-      // Required by AdPiler
-      form.append('type', labelMetadata.type);
-      form.append('network', labelMetadata.network);
+      // Optional fields based on label logic
+      if (labelMeta.type) form.append('type', labelMeta.type);
+      if (labelMeta.network) form.append('network', labelMeta.network);
 
-      // Metadata
+      // Common metadata
       form.append('primary_text', metadata.primaryText);
       form.append('headline', metadata.headline);
       form.append('description', metadata.description);
