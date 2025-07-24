@@ -83,8 +83,9 @@ async function uploadToAdpiler(card, attachments) {
       if (!imageResponse.ok) throw new Error(`Failed to fetch attachment: ${attachment.url}`);
 
       const buffer = await imageResponse.buffer();
-      const form = new FormData();
+      console.log(`🧪 Image buffer size: ${buffer.length}`);
 
+      const form = new FormData();
       form.append('client_id', mapping.clientId);
       form.append('name', attachment.name);
       form.append('image', buffer, attachment.name);
@@ -99,8 +100,8 @@ async function uploadToAdpiler(card, attachments) {
       form.append('clickthrough_url', metadata.clickthroughUrl);
 
       const uploadUrl = `${ADPILER_BASE_URL}/campaigns/${mapping.campaignId}/social-ads`;
-
       console.log(`📤 Uploading to AdPiler (campaign ${mapping.campaignId})...`);
+
       const uploadResponse = await fetch(uploadUrl, {
         method: 'POST',
         headers: {
