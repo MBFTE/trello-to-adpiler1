@@ -27,17 +27,16 @@ async function getClientMapping(cardName) {
 }
 
 function extractLabelMetadata(labels) {
-  const labelNames = labels.map(label => label.name?.toLowerCase());
+  const labelNames = labels.map(label => label.name?.toLowerCase() || "");
+
+  console.log("🧪 Labels received:", labelNames);
 
   if (labelNames.includes("social")) {
-    return {
-      type: "post",
-      network: "facebook"
-    };
+    return { type: "post", network: "facebook" };
   }
 
   if (labelNames.includes("display")) {
-    return {}; // Display ads don’t need type or network
+    return {}; // Display campaigns don’t require type/network
   }
 
   return null;
@@ -120,3 +119,4 @@ async function uploadToAdpiler(card, attachments) {
 }
 
 module.exports = { uploadToAdpiler };
+
