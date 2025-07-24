@@ -1,65 +1,58 @@
-require('dotenv').config();
+// server.js
 const express = require('express');
 const bodyParser = require('body-parser');
-const uploadToAdpiler = require('./upload-to-adpiler');
+const dotenv = require('dotenv');
+const { uploadToAdpiler } = require('./upload-to-adpiler');
+
+dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT;
+const PORT = process.env.PORT || 10000;
 
 app.use(bodyParser.json());
 
 app.post('/webhook', async (req, res) => {
-  const action = req.body?.action;
-  const listName = process.env.TARGET_LIST_NAME || 'Ready for AdPiler';
-
-  // Debug logs
-  if (!action || !action.type || !action.data?.card) {
-    console.log('⚠️ Webhook ignored: missing or malformed action');
-    return res.status(200).send('Ignored');
+  const action = req.body.action;
+  if (!action) {
+    console.log("⚠️ No action in webhook payload.");
+    return res.status(400).send("No action found.");
   }
 
-  const cardId = action.data.card.id;
-  const destination = action.data?.listAfter?.name || '';
-  const type = action.type;
+  const type = action.type || '';
+  const card = action.data?.card;
+  const listAfter = action.data?.listAfter?.name || '';
+  const cardId = card?.id;
 
-  console.log(`📩 Webhook received: type=${type}, to="${destination}"`);
+  console.log("📩 Webhook received: type=" + type + ", to=\"" + listAfter + "\"");
 
-  if (
-    type === 'updateCard' &&
-    destination.toLowerCase() === listName.toLowerCase()
-  ) {
+  if (type === "updateCard" && listAfter === "Ready for Adpiler") {
+    if (!cardId) {
+      console.log("❌ No card ID provided.");
+      return res.status(400).send("Card ID is missing.");
+    }
+
     try {
-      await uploadToAdpiler(cardId, {
-        TRELLO_KEY: process.env.TRELLO_API_KEY,
-        TRELLO_TOKEN: process.env.TRELLO_TOKEN,
-        ADPILER_API_KEY: process.env.ADPILER_API_KEY,
-        CLIENT_LOOKUP_CSV_URL: process.env.CLIENT_SHEET_CSV
-      });
-      res.status(200).send('Upload triggered');
+      console.log("🚀 Uploading card ID:", cardId);
+      await uploadToAdpiler(cardId);
+      res.status(200).send("Upload attempted.");
     } catch (err) {
-      console.error('❌ Upload failed:', err.message || err);
-      res.status(500).send('Upload failed');
+      console.error("❌ Upload failed:", err.message || err);
+      res.status(500).send("Upload failed: " + (err.message || err));
     }
   } else {
-    res.status(200).send('No relevant action');
+    res.status(200).send("Ignored.");
   }
 });
 
 app.get('/', (req, res) => {
-  res.send('✅ Trello → AdPiler webhook is running');
-});
-
-app.head('/webhook', (req, res) => {
-  console.log('✅ Trello HEAD verification request received');
-  res.status(200).end();
+  res.send('✅ Trello to AdPiler webhook server is running!');
 });
 
 app.listen(PORT, () => {
   console.log(`🌐 Server running on port ${PORT}`);
-  console.log('==> Your service is live 🎉');
-  console.log('==> ');
-  console.log('==> ///////////////////////////////////////////////////////////');
+  console.log("==> Your service is live 🎉");
+  console.log("==> ");
+  console.log("==> ///////////////////////////////////////////////////////////");
   console.log(`==> Available at your primary URL https://trello-to-adpiler.onrender.com`);
-  console.log('==> ///////////////////////////////////////////////////////////');
+  console.log("==> ///////////////////////////////////////////////////////////");
 });
-
