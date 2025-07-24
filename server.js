@@ -1,7 +1,7 @@
-// server.js
 const express = require('express');
 const bodyParser = require('body-parser');
 const dotenv = require('dotenv');
+const fetch = require('node-fetch');
 const { uploadToAdpiler } = require('./upload-to-adpiler');
 
 dotenv.config();
@@ -10,6 +10,13 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 app.use(bodyParser.json());
+
+async function getCardAttachments(cardId) {
+  const url = `https://api.trello.com/1/cards/${cardId}/attachments?key=${process.env.TRELLO_API_KEY}&token=${process.env.TRELLO_TOKEN}`;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error("Failed to fetch attachments");
+  return await response.json();
+}
 
 app.post('/webhook', async (req, res) => {
   const action = req.body.action;
@@ -26,14 +33,15 @@ app.post('/webhook', async (req, res) => {
   console.log("📩 Webhook received: type=" + type + ", to=\"" + listAfter + "\"");
 
   if (type === "updateCard" && listAfter === "Ready for Adpiler") {
-    if (!cardId) {
-      console.log("❌ No card ID provided.");
-      return res.status(400).send("Card ID is missing.");
+    if (!cardId || !card) {
+      console.log("❌ Missing card data.");
+      return res.status(400).send("Card info is incomplete.");
     }
 
     try {
       console.log("🚀 Uploading card ID:", cardId);
-      await uploadToAdpiler(cardId);
+      const attachments = await getCardAttachments(cardId);
+      await uploadToAdpiler(card, attachments);
       res.status(200).send("Upload attempted.");
     } catch (err) {
       console.error("❌ Upload failed:", err.message || err);
@@ -50,9 +58,5 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🌐 Server running on port ${PORT}`);
-  console.log("==> Your service is live 🎉");
-  console.log("==> ");
-  console.log("==> ///////////////////////////////////////////////////////////");
-  console.log(`==> Available at your primary URL https://trello-to-adpiler.onrender.com`);
-  console.log("==> ///////////////////////////////////////////////////////////");
 });
+
