@@ -1,53 +1,46 @@
+const fs = require('fs');
+const path = require('path');
 const fetch = require('node-fetch');
 const FormData = require('form-data');
 const csv = require('csvtojson');
-const sharp = require('sharp'); // Image fallback tool
+const sharp = require('sharp');
 
 const ADPILER_API_KEY = process.env.ADPILER_API_KEY;
 const ADPILER_BASE_URL = process.env.ADPILER_BASE_URL;
 const TRELLO_API_KEY = process.env.TRELLO_API_KEY;
 const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
 
-const CLIENT_CSV_URL =
-  'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
+const CLIENT_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
 
 async function getClientMapping(cardName) {
   const response = await fetch(CLIENT_CSV_URL);
   const csvText = await response.text();
   const clients = await csv().fromString(csvText);
-
   const match = clients.find(c =>
     cardName.toLowerCase().startsWith((c['Trello Client Name'] || '').toLowerCase())
   );
-
-  if (!match) return null;
-
-  return {
+  return match ? {
     clientId: match['Adpiler Client ID'],
     campaignId: match['Adpiler Campaign ID']
-  };
+  } : null;
 }
 
 function extractLabelMetadata(labels) {
   const labelNames = labels.map(label => label.name?.toLowerCase() || '');
-  console.log('🧪 Labels received:', labelNames);
-
   if (labelNames.includes('social')) {
     return { type: 'post', network: 'facebook' };
   }
-
   if (labelNames.includes('display')) {
-    return {}; // Display doesn't need type/network
+    return {}; // Future expansion
   }
-
   return null;
 }
 
 async function getCardDetails(cardId) {
-  const baseUrl = `https://api.trello.com/1/cards/${cardId}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}&fields=name,desc,url`;
-  const baseResponse = await fetch(baseUrl);
-  if (!baseResponse.ok) throw new Error('Failed to fetch card fields');
-  const card = await baseResponse.json();
+  const fieldsUrl = `https://api.trello.com/1/cards/${cardId}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}&fields=name,desc,url`;
+  const fieldsRes = await fetch(fieldsUrl);
+  if (!fieldsRes.ok) throw new Error('Failed to fetch card fields');
+  const card = await fieldsRes.json();
 
   const labelUrl = `https://api.trello.com/1/cards/${cardId}/labels?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
   const labelRes = await fetch(labelUrl);
@@ -56,17 +49,14 @@ async function getCardDetails(cardId) {
   return card;
 }
 
-async function uploadToAdpiler(card, attachments) {
+async function uploadToAdpiler(card, attachments, logoPath = null) {
   try {
     const mapping = await getClientMapping(card.name);
-    if (!mapping) throw new Error(`No matching entry found for card: ${card.name}`);
-
-    console.log(`🎯 AdPiler Client ID: ${mapping.clientId}`);
-    console.log(`🚀 AdPiler Campaign ID: ${mapping.campaignId}`);
+    if (!mapping) throw new Error(`No matching client for card: ${card.name}`);
 
     const cardDetails = await getCardDetails(card.id);
     const labelMeta = extractLabelMetadata(cardDetails.labels || []);
-    if (!labelMeta) throw new Error(`Card "${card.name}" missing 'Social' or 'Display' label.`);
+    if (!labelMeta) throw new Error(`Card "${card.name}" missing required labels.`);
 
     const metadata = {
       primaryText: cardDetails.desc || '',
@@ -76,96 +66,68 @@ async function uploadToAdpiler(card, attachments) {
       clickthroughUrl: cardDetails.url || ''
     };
 
+    const isCarousel = card.name.toLowerCase().includes('carousel');
     const uploadUrl = `${ADPILER_BASE_URL}/campaigns/${mapping.campaignId}/social-ads`;
 
-    for (const attachment of attachments) {
-      console.log(`📥 Fetching image: ${attachment.name}`);
-      const imageResponse = await fetch(
-        `${attachment.url}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`
-      );
-      if (!imageResponse.ok) throw new Error(`Failed to fetch attachment: ${attachment.url}`);
+    const sortedAttachments = attachments.sort((a, b) =>
+      a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+    );
 
-      const buffer = await imageResponse.buffer();
-      console.log(`🧪 Image buffer size: ${buffer.length}`);
+    const form = new FormData();
+    form.append('client_id', mapping.clientId);
+    form.append('name', card.name);
+    form.append('page_name', 'Adpiler');
+    form.append('message', metadata.primaryText);
+    if (labelMeta.type) form.append('type', labelMeta.type);
+    if (labelMeta.network) form.append('network', labelMeta.network);
+    form.append('headline', metadata.headline);
+    form.append('description', metadata.description);
+    form.append('cta', metadata.callToAction);
+    form.append('clickthrough_url', metadata.clickthroughUrl);
+    if (logoPath) form.append('logo', fs.createReadStream(path.resolve(logoPath)));
 
-      const form = new FormData();
-      form.append('client_id', mapping.clientId);
-      form.append('name', attachment.name);
-      form.append('image', buffer, attachment.name);
-
-      if (labelMeta.type) form.append('type', labelMeta.type);
-      if (labelMeta.network) form.append('network', labelMeta.network);
-      form.append('primary_text', metadata.primaryText);
-      form.append('headline', metadata.headline);
-      form.append('description', metadata.description);
-      form.append('cta', metadata.callToAction);
-      form.append('clickthrough_url', metadata.clickthroughUrl);
-
-      console.log(`📤 Uploading to AdPiler (PNG)...`);
-
-      let uploadResponse = await fetch(uploadUrl, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${ADPILER_API_KEY}`,
-          ...form.getHeaders()
-        },
-        body: form
-      });
-
-      const contentType = uploadResponse.headers.get('content-type');
-      const result = contentType?.includes('application/json')
-        ? await uploadResponse.json()
-        : await uploadResponse.text();
-
-      if (!uploadResponse.ok && result?.message === 'Server Error') {
-        console.warn(`⚠️ PNG upload failed — retrying as JPEG...`);
-
-        const jpegBuffer = await sharp(buffer).jpeg().toBuffer();
-        const jpegForm = new FormData();
-
-        jpegForm.append('client_id', mapping.clientId);
-        jpegForm.append('name', attachment.name.replace('.png', '.jpg'));
-        jpegForm.append('image', jpegBuffer, {
-          filename: attachment.name.replace('.png', '.jpg'),
-          contentType: 'image/jpeg'
-        });
-
-        if (labelMeta.type) jpegForm.append('type', labelMeta.type);
-        if (labelMeta.network) jpegForm.append('network', labelMeta.network);
-        jpegForm.append('primary_text', metadata.primaryText);
-        jpegForm.append('headline', metadata.headline);
-        jpegForm.append('description', metadata.description);
-        jpegForm.append('cta', metadata.callToAction);
-        jpegForm.append('clickthrough_url', metadata.clickthroughUrl);
-
-        const retryResponse = await fetch(uploadUrl, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${ADPILER_API_KEY}`,
-            ...jpegForm.getHeaders()
-          },
-          body: jpegForm
-        });
-
-        const retryContent = retryResponse.headers.get('content-type');
-        const retryResult = retryContent?.includes('application/json')
-          ? await retryResponse.json()
-          : await retryResponse.text();
-
-        if (!retryResponse.ok) {
-          console.error(`❌ JPEG fallback also failed:`, retryResult);
-        } else {
-          console.log(`✅ JPEG uploaded after PNG failed: ${attachment.name}`);
-        }
-      } else if (!uploadResponse.ok) {
-        console.error(`❌ Upload failed:`, result);
-      } else {
-        console.log(`✅ Uploaded slide: ${attachment.name}`);
-      }
+    for (const att of sortedAttachments) {
+      console.log(`📥 Fetching image: ${att.name}`);
+      const imageRes = await fetch(`${att.url}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`);
+      if (!imageRes.ok) throw new Error(`Failed to fetch attachment: ${att.url}`);
+      const buffer = await imageRes.buffer();
+      att.buffer = buffer;
     }
+
+    if (isCarousel && sortedAttachments.length > 1) {
+      console.log('🎠 Uploading as Carousel Ad');
+      sortedAttachments.forEach(att => {
+        form.append('slides[]', att.buffer, att.name);
+      });
+    } else {
+      console.log('🖼️ Uploading as Regular Social Ad');
+      form.append('image', sortedAttachments[0].buffer, sortedAttachments[0].name);
+    }
+
+    const response = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${ADPILER_API_KEY}`,
+        ...form.getHeaders()
+      },
+      body: form
+    });
+
+    const contentType = response.headers.get('content-type');
+    const result = contentType?.includes('application/json')
+      ? await response.json()
+      : await response.text();
+
+    if (!response.ok) {
+      console.error(`❌ Upload failed:`, result);
+    } else {
+      console.log(`✅ Upload successful! Ad created:`, result);
+    }
+
   } catch (err) {
-    console.error(`❌ Upload error: ${err.message}`);
+    console.error(`🚨 Upload error: ${err.message}`);
   }
 }
 
 module.exports = { uploadToAdpiler };
+
