@@ -26,8 +26,29 @@ async function getClientMapping(cardName) {
   };
 }
 
+function extractTypeAndNetworkFromLabels(labels, cardName) {
+  const labelNames = labels.map(l => l.name?.toLowerCase() || "");
+
+  if (labelNames.includes("social")) {
+    const isCarousel = cardName.toLowerCase().includes("carousel");
+    return {
+      network: "facebook",
+      type: isCarousel ? "carousel" : "image"
+    };
+  }
+
+  if (labelNames.includes("display")) {
+    return {
+      network: "google",
+      type: "image"
+    };
+  }
+
+  return null;
+}
+
 async function getCardDetails(cardId) {
-  const url = `https://api.trello.com/1/cards/${cardId}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}&fields=name,desc,url`;
+  const url = `https://api.trello.com/1/cards/${cardId}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}&fields=name,desc,url,labels`;
   const response = await fetch(url);
   if (!response.ok) throw new Error("Failed to fetch card details");
   return await response.json();
@@ -42,13 +63,16 @@ async function uploadToAdpiler(card, attachments) {
     console.log(`📁 AdPiler Folder ID (Campaign ID): ${mapping.folderId}`);
 
     const cardDetails = await getCardDetails(card.id);
+    const labelMetadata = extractTypeAndNetworkFromLabels(cardDetails.labels || [], card.name);
+
+    if (!labelMetadata) throw new Error(`Card "${card.name}" missing 'Social' or 'Display' label.`);
 
     const metadata = {
-      primaryText: cardDetails.desc || "",             // Treat description as caption
+      primaryText: cardDetails.desc || "",
       headline: cardDetails.name || "",
-      clickthroughUrl: cardDetails.url || "",
-      callToAction: "Learn More",                      // Placeholder CTA
-      description: cardDetails.desc || ""
+      description: cardDetails.desc || "",
+      callToAction: "Learn More",
+      clickthroughUrl: cardDetails.url || ""
     };
 
     for (let attachment of attachments) {
@@ -63,16 +87,18 @@ async function uploadToAdpiler(card, attachments) {
       form.append('name', attachment.name);
       form.append('image', buffer, attachment.name);
 
-      // AdPiler campaign-specific path
-      const uploadUrl = `${ADPILER_BASE_URL}/campaigns/${mapping.folderId}/social-ads`;
+      // Required by AdPiler
+      form.append('type', labelMetadata.type);
+      form.append('network', labelMetadata.network);
 
-      // Attach metadata
+      // Metadata
       form.append('primary_text', metadata.primaryText);
       form.append('headline', metadata.headline);
       form.append('description', metadata.description);
       form.append('cta', metadata.callToAction);
       form.append('clickthrough_url', metadata.clickthroughUrl);
 
+      const uploadUrl = `${ADPILER_BASE_URL}/campaigns/${mapping.folderId}/social-ads`;
       console.log(`📤 Uploading to AdPiler...`);
       const uploadResponse = await fetch(uploadUrl, {
         method: 'POST',
@@ -100,4 +126,3 @@ async function uploadToAdpiler(card, attachments) {
 }
 
 module.exports = { uploadToAdpiler };
-
