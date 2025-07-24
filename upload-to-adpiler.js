@@ -26,13 +26,30 @@ async function getClientMapping(cardName) {
   };
 }
 
+async function getCardDetails(cardId) {
+  const url = `https://api.trello.com/1/cards/${cardId}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}&fields=name,desc,url`;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error("Failed to fetch card details");
+  return await response.json();
+}
+
 async function uploadToAdpiler(card, attachments) {
   try {
     const mapping = await getClientMapping(card.name);
     if (!mapping) throw new Error(`No matching entry found for card: ${card.name}`);
 
     console.log(`🎯 AdPiler Client ID: ${mapping.clientId}`);
-    console.log(`📁 AdPiler Folder ID: ${mapping.folderId}`);
+    console.log(`📁 AdPiler Folder ID (Campaign ID): ${mapping.folderId}`);
+
+    const cardDetails = await getCardDetails(card.id);
+
+    const metadata = {
+      primaryText: cardDetails.desc || "",             // Treat description as caption
+      headline: cardDetails.name || "",
+      clickthroughUrl: cardDetails.url || "",
+      callToAction: "Learn More",                      // Placeholder CTA
+      description: cardDetails.desc || ""
+    };
 
     for (let attachment of attachments) {
       console.log(`📥 Fetching image: ${attachment.name}`);
@@ -43,12 +60,21 @@ async function uploadToAdpiler(card, attachments) {
 
       const form = new FormData();
       form.append('client_id', mapping.clientId);
-      form.append('folder_id', mapping.folderId);
       form.append('name', attachment.name);
       form.append('image', buffer, attachment.name);
 
+      // AdPiler campaign-specific path
+      const uploadUrl = `${ADPILER_BASE_URL}/campaigns/${mapping.folderId}/social-ads`;
+
+      // Attach metadata
+      form.append('primary_text', metadata.primaryText);
+      form.append('headline', metadata.headline);
+      form.append('description', metadata.description);
+      form.append('cta', metadata.callToAction);
+      form.append('clickthrough_url', metadata.clickthroughUrl);
+
       console.log(`📤 Uploading to AdPiler...`);
-      const uploadResponse = await fetch(`${ADPILER_BASE_URL}/social-ads-slides`, {
+      const uploadResponse = await fetch(uploadUrl, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${ADPILER_API_KEY}`,
@@ -57,7 +83,11 @@ async function uploadToAdpiler(card, attachments) {
         body: form
       });
 
-      const result = await uploadResponse.json();
+      const contentType = uploadResponse.headers.get("content-type");
+      const result = contentType?.includes("application/json")
+        ? await uploadResponse.json()
+        : await uploadResponse.text();
+
       if (!uploadResponse.ok) {
         console.error(`❌ Upload failed:`, result);
       } else {
