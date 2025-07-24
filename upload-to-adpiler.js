@@ -55,5 +55,4 @@ async function uploadToAdpiler(card, attachments) {
   }
 }
 
-module.exports = uploadToAdpiler;
-
+module.exports = { uploadToAdpiler };
