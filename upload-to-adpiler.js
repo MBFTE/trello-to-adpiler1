@@ -1,109 +1,101 @@
-// upload-to-adpiler.js
 const fetch = require('node-fetch');
 const FormData = require('form-data');
 const csv = require('csvtojson');
 
-const ALLOWED_MIME_TYPES = [
-  'image/png',
-  'image/jpeg',
-  'image/gif',
-  'video/mp4'
-];
+module.exports = async function uploadToAdpiler(cardId, env) {
+  const {
+    TRELLO_KEY,
+    TRELLO_TOKEN,
+    ADPILER_API_KEY,
+    CLIENT_LOOKUP_CSV_URL,
+  } = env;
 
-const ALLOWED_DIMENSIONS = [
-  { width: 1200, height: 1200 }, // social
-  { width: 300, height: 600 }    // display
-];
-
-async function uploadToAdpiler(cardId, env) {
   console.log(`🚀 Uploading card ID: ${cardId}`);
-  console.log(`🔐 Using API key: ${env.ADPILER_API_KEY}`);
+  console.log(`🔐 Using API key: ${ADPILER_API_KEY}`);
 
-  // Step 1: Fetch card data from Trello
-  const cardUrl = `https://api.trello.com/1/cards/${cardId}?fields=name,desc&attachments=true&attachment_fields=bytes,date,mimeType,name,url&key=${env.TRELLO_KEY}&token=${env.TRELLO_TOKEN}`;
-  const cardRes = await fetch(cardUrl);
-  if (!cardRes.ok) throw new Error('Failed to fetch Trello card');
+  // 1. Fetch card details from Trello
+  const cardRes = await fetch(
+    `https://api.trello.com/1/cards/${cardId}?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`
+  );
   const card = await cardRes.json();
 
-  const cardName = card.name;
-  const matchKey = cardName.split(':')[0].trim().toLowerCase();
-  console.log(`🧾 Client detected: "${cardName}"\n→ Match Key: "${matchKey}"`);
+  const cardName = card.name || '';
+  const clientMatchKey = cardName.split(':')[0].trim().toLowerCase();
+  console.log(`🧾 Client detected: "${cardName}"\n→ Match Key: "${clientMatchKey}"`);
 
-  // Step 2: Fetch client lookup CSV
-  const csvRes = await fetch(env.CLIENT_LOOKUP_CSV_URL);
-  if (!csvRes.ok) throw new Error('Failed to fetch client CSV');
-  const csvText = await csvRes.text();
-  const clients = await csv().fromString(csvText);
+  // 2. Fetch CSV and find matching client ID
+  const csvRes = await fetch(CLIENT_LOOKUP_CSV_URL);
+  const clients = await csv().fromString(await csvRes.text());
 
-  const matchedClient = clients.find(row => row['Trello Client Name'].toLowerCase().trim() === matchKey);
-  if (!matchedClient) throw new Error(`Client match not found for: "${matchKey}"`);
-  const client_id = matchedClient['Adpiler Client ID'];
+  const match = clients.find(
+    (row) =>
+      (row['Trello Client Name'] || '').toLowerCase().trim() === clientMatchKey
+  );
 
-  // Step 3: Build attachment payloads
-  const attachments = (card.attachments || []).filter(att => {
-    return ALLOWED_MIME_TYPES.includes(att.mimeType);
-  });
+  if (!match) throw new Error(`Client "${clientMatchKey}" not found in sheet.`);
 
-  if (attachments.length === 0) throw new Error('No valid attachments to upload');
+  const adpilerClientId = match['AdPiler Client ID'];
+  if (!adpilerClientId) throw new Error(`No AdPiler Client ID for "${clientMatchKey}"`);
 
-  const uploadQueue = attachments.map(att => ({
-    name: att.name,
-    url: `${att.url}?key=${env.TRELLO_KEY}&token=${env.TRELLO_TOKEN}`
-  }));
+  // 3. Fetch attachments from Trello
+  const attachRes = await fetch(
+    `https://api.trello.com/1/cards/${cardId}/attachments?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`
+  );
+  const attachments = await attachRes.json();
 
-  console.log(`📎 Prepared ${uploadQueue.length} attachments for upload`);
+  console.log(`📎 Found ${attachments.length} attachments`);
 
-  // Step 4: Prepare metadata (custom fields pulled from description)
-  const meta = extractMetadata(card.desc);
-  if (!meta.headline || !meta.description) {
-    console.warn('⚠️ Missing metadata (headline/description)');
-  }
+  const uploadQueue = [];
 
-  // Step 5: Upload to Adpiler (loop through attachments)
-  for (const creative of uploadQueue) {
-    const payload = {
-      client_id,
-      name: creative.name,
-      platform: 'social',
-      file_url: creative.url,
-      headline: meta.headline || '',
-      description: meta.description || '',
-      caption: meta.caption || '',
-      cta: meta.cta || '',
-      click_url: meta.url || ''
-    };
+  for (const file of attachments) {
+    const name = file.name;
+    const mimeType = file.mimeType || '';
+    const size = file.bytes || 0;
+    const url = file.url;
 
-    const res = await fetch('https://platform.adpiler.com/api/creatives', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': env.ADPILER_API_KEY
-      },
-      body: JSON.stringify(payload)
-    });
+    console.log(`📎 Checking attachment: ${name} | mime=${mimeType} | size=${size}`);
 
-    const resData = await res.json();
-    if (!res.ok) {
-      console.error(`❌ Upload failed for ${creative.name}:`, resData);
-      throw new Error(resData.message || 'Upload failed');
+    if (!url || !url.startsWith('http')) {
+      console.warn(`⚠️ Skipping file "${name}" — invalid or missing URL`);
+      continue;
     }
 
-    console.log(`✅ Uploaded ${creative.name} → ID ${resData.id}`);
-  }
-}
+    const downloadUrl = `${url}?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}`;
 
-function extractMetadata(desc) {
-  const fields = ['headline', 'description', 'caption', 'cta', 'url'];
-  const meta = {};
-
-  for (const field of fields) {
-    const regex = new RegExp(`${field}:\\s*(.+)`, 'i');
-    const match = desc.match(regex);
-    if (match) meta[field] = match[1].trim();
+    uploadQueue.push({
+      name,
+      url: downloadUrl,
+    });
   }
 
-  return meta;
-}
+  if (uploadQueue.length === 0) {
+    throw new Error('No valid attachments to upload.');
+  }
 
-module.exports = uploadToAdpiler;
+  console.log('✅ Valid files for upload:', uploadQueue.map((f) => f.name));
 
+  // 4. Upload each file to AdPiler as social ad
+  for (const asset of uploadQueue) {
+    const form = new FormData();
+    form.append('client_id', adpilerClientId);
+    form.append('title', cardName); // or customize per file if needed
+    form.append('type', 'social');
+    form.append('file_url', asset.url);
+
+    const adpilerRes = await fetch('https://platform.adpiler.com/api/mockups', {
+      method: 'POST',
+      headers: {
+        'X-API-KEY': ADPILER_API_KEY,
+      },
+      body: form,
+    });
+
+    const json = await adpilerRes.json();
+
+    if (!adpilerRes.ok) {
+      console.error(`❌ Error uploading ${asset.name}:`, json.message || json);
+    } else {
+      console.log(`🎉 Uploaded ${asset.name} to AdPiler`);
+    }
+  }
+};
