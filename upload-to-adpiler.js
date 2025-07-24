@@ -7,7 +7,8 @@ const ADPILER_BASE_URL = process.env.ADPILER_BASE_URL;
 const TRELLO_API_KEY = process.env.TRELLO_API_KEY;
 const TRELLO_TOKEN = process.env.TRELLO_TOKEN;
 
-const CLIENT_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv";
+const CLIENT_CSV_URL =
+  'https://docs.google.com/spreadsheets/d/e/2PACX-1vRz1UmGBfYraNSQilE6KWPOKKYhtuTeNqlOhUgtO8PcYLs2w05zzdtb7ovWSB2EMFQ1oLP0eDslFhSq/pub?output=csv';
 
 async function getClientMapping(cardName) {
   const response = await fetch(CLIENT_CSV_URL);
@@ -15,26 +16,26 @@ async function getClientMapping(cardName) {
   const clients = await csv().fromString(csvText);
 
   const match = clients.find(c =>
-    cardName.toLowerCase().startsWith((c["Trello Client Name"] || "").toLowerCase())
+    cardName.toLowerCase().startsWith((c['Trello Client Name'] || '').toLowerCase())
   );
 
   if (!match) return null;
 
   return {
-    clientId: match["Adpiler Client ID"],
-    folderId: match["Adpiler Folder ID"]
+    clientId: match['Adpiler Client ID'],
+    campaignId: match['Adpiler Campaign ID']
   };
 }
 
 function extractLabelMetadata(labels) {
-  const labelNames = labels.map(label => label.name?.toLowerCase() || "");
-  console.log("🧪 Labels received:", labelNames);
+  const labelNames = labels.map(label => label.name?.toLowerCase() || '');
+  console.log('🧪 Labels received:', labelNames);
 
-  if (labelNames.includes("social")) {
-    return { type: "post", network: "facebook" };
+  if (labelNames.includes('social')) {
+    return { type: 'post', network: 'facebook' };
   }
 
-  if (labelNames.includes("display")) {
+  if (labelNames.includes('display')) {
     return {}; // Display doesn't need type/network
   }
 
@@ -42,13 +43,11 @@ function extractLabelMetadata(labels) {
 }
 
 async function getCardDetails(cardId) {
-  // Fetch basic card details
   const baseUrl = `https://api.trello.com/1/cards/${cardId}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}&fields=name,desc,url`;
   const baseResponse = await fetch(baseUrl);
-  if (!baseResponse.ok) throw new Error("Failed to fetch card fields");
+  if (!baseResponse.ok) throw new Error('Failed to fetch card fields');
   const card = await baseResponse.json();
 
-  // Fetch labels explicitly to avoid timing bugs
   const labelUrl = `https://api.trello.com/1/cards/${cardId}/labels?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
   const labelRes = await fetch(labelUrl);
   card.labels = labelRes.ok ? await labelRes.json() : [];
@@ -62,55 +61,57 @@ async function uploadToAdpiler(card, attachments) {
     if (!mapping) throw new Error(`No matching entry found for card: ${card.name}`);
 
     console.log(`🎯 AdPiler Client ID: ${mapping.clientId}`);
-    console.log(`📁 AdPiler Folder ID (Campaign ID): ${mapping.folderId}`);
+    console.log(`🚀 AdPiler Campaign ID: ${mapping.campaignId}`);
 
     const cardDetails = await getCardDetails(card.id);
     const labelMeta = extractLabelMetadata(cardDetails.labels || []);
     if (!labelMeta) throw new Error(`Card "${card.name}" missing 'Social' or 'Display' label.`);
 
     const metadata = {
-      primaryText: cardDetails.desc || "",
-      headline: cardDetails.name || "",
-      description: cardDetails.desc || "",
-      callToAction: "Learn More",
-      clickthroughUrl: cardDetails.url || ""
+      primaryText: cardDetails.desc || '',
+      headline: cardDetails.name || '',
+      description: cardDetails.desc || '',
+      callToAction: 'Learn More',
+      clickthroughUrl: cardDetails.url || ''
     };
 
     for (const attachment of attachments) {
       console.log(`📥 Fetching image: ${attachment.name}`);
-      const imageResponse = await fetch(`${attachment.url}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`);
+      const imageResponse = await fetch(
+        `${attachment.url}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`
+      );
       if (!imageResponse.ok) throw new Error(`Failed to fetch attachment: ${attachment.url}`);
 
       const buffer = await imageResponse.buffer();
       const form = new FormData();
 
-      form.append("client_id", mapping.clientId);
-      form.append("name", attachment.name);
-      form.append("image", buffer, attachment.name);
+      form.append('client_id', mapping.clientId);
+      form.append('name', attachment.name);
+      form.append('image', buffer, attachment.name);
 
-      if (labelMeta.type) form.append("type", labelMeta.type);
-      if (labelMeta.network) form.append("network", labelMeta.network);
+      if (labelMeta.type) form.append('type', labelMeta.type);
+      if (labelMeta.network) form.append('network', labelMeta.network);
 
-      form.append("primary_text", metadata.primaryText);
-      form.append("headline", metadata.headline);
-      form.append("description", metadata.description);
-      form.append("cta", metadata.callToAction);
-      form.append("clickthrough_url", metadata.clickthroughUrl);
+      form.append('primary_text', metadata.primaryText);
+      form.append('headline', metadata.headline);
+      form.append('description', metadata.description);
+      form.append('cta', metadata.callToAction);
+      form.append('clickthrough_url', metadata.clickthroughUrl);
 
-      const uploadUrl = `${ADPILER_BASE_URL}/campaigns/${mapping.folderId}/social-ads`;
+      const uploadUrl = `${ADPILER_BASE_URL}/campaigns/${mapping.campaignId}/social-ads`;
 
-      console.log(`📤 Uploading to AdPiler...`);
+      console.log(`📤 Uploading to AdPiler (campaign ${mapping.campaignId})...`);
       const uploadResponse = await fetch(uploadUrl, {
-        method: "POST",
+        method: 'POST',
         headers: {
           Authorization: `Bearer ${ADPILER_API_KEY}`,
-          ...form.getHeaders(),
+          ...form.getHeaders()
         },
-        body: form,
+        body: form
       });
 
-      const contentType = uploadResponse.headers.get("content-type");
-      const result = contentType?.includes("application/json")
+      const contentType = uploadResponse.headers.get('content-type');
+      const result = contentType?.includes('application/json')
         ? await uploadResponse.json()
         : await uploadResponse.text();
 
