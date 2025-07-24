@@ -26,8 +26,8 @@ async function getClientMapping(cardName) {
   };
 }
 
-function extractLabelMetadata(labels, cardName) {
-  const labelNames = labels.map(l => l.name?.toLowerCase() || "");
+function extractLabelMetadata(labels) {
+  const labelNames = labels.map(label => label.name?.toLowerCase());
 
   if (labelNames.includes("social")) {
     return {
@@ -37,14 +37,14 @@ function extractLabelMetadata(labels, cardName) {
   }
 
   if (labelNames.includes("display")) {
-    return {}; // Display campaigns don’t require type/network
+    return {}; // Display ads don’t need type or network
   }
 
   return null;
 }
 
 async function getCardDetails(cardId) {
-  const url = `https://api.trello.com/1/cards/${cardId}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}&fields=name,desc,url&attachments=true&labels=true`;
+  const url = `https://api.trello.com/1/cards/${cardId}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}&fields=name,desc,url&labels=all`;
   const response = await fetch(url);
   if (!response.ok) throw new Error("Failed to fetch card details");
   return await response.json();
@@ -59,7 +59,7 @@ async function uploadToAdpiler(card, attachments) {
     console.log(`📁 AdPiler Folder ID (Campaign ID): ${mapping.folderId}`);
 
     const cardDetails = await getCardDetails(card.id);
-    const labelMeta = extractLabelMetadata(cardDetails.labels || [], card.name);
+    const labelMeta = extractLabelMetadata(cardDetails.labels || []);
     if (!labelMeta) throw new Error(`Card "${card.name}" missing 'Social' or 'Display' label.`);
 
     const metadata = {
@@ -70,23 +70,21 @@ async function uploadToAdpiler(card, attachments) {
       clickthroughUrl: cardDetails.url || ""
     };
 
-    for (let attachment of attachments) {
+    for (const attachment of attachments) {
       console.log(`📥 Fetching image: ${attachment.name}`);
-      const response = await fetch(`${attachment.url}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`);
-      if (!response.ok) throw new Error(`Failed to fetch attachment: ${attachment.url}`);
+      const imageResponse = await fetch(`${attachment.url}?key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`);
+      if (!imageResponse.ok) throw new Error(`Failed to fetch attachment: ${attachment.url}`);
 
-      const buffer = await response.buffer();
+      const buffer = await imageResponse.buffer();
 
       const form = new FormData();
       form.append('client_id', mapping.clientId);
       form.append('name', attachment.name);
       form.append('image', buffer, attachment.name);
 
-      // Optional fields based on label logic
       if (labelMeta.type) form.append('type', labelMeta.type);
       if (labelMeta.network) form.append('network', labelMeta.network);
 
-      // Common metadata
       form.append('primary_text', metadata.primaryText);
       form.append('headline', metadata.headline);
       form.append('description', metadata.description);
@@ -94,6 +92,7 @@ async function uploadToAdpiler(card, attachments) {
       form.append('clickthrough_url', metadata.clickthroughUrl);
 
       const uploadUrl = `${ADPILER_BASE_URL}/campaigns/${mapping.folderId}/social-ads`;
+
       console.log(`📤 Uploading to AdPiler...`);
       const uploadResponse = await fetch(uploadUrl, {
         method: 'POST',
