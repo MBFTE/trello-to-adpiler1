@@ -1,6 +1,7 @@
 const fetch = require('node-fetch');
 const FormData = require('form-data');
 const csv = require('csvtojson');
+const sharp = require('sharp'); // Image fallback tool
 
 const ADPILER_API_KEY = process.env.ADPILER_API_KEY;
 const ADPILER_BASE_URL = process.env.ADPILER_BASE_URL;
@@ -75,6 +76,8 @@ async function uploadToAdpiler(card, attachments) {
       clickthroughUrl: cardDetails.url || ''
     };
 
+    const uploadUrl = `${ADPILER_BASE_URL}/campaigns/${mapping.campaignId}/social-ads`;
+
     for (const attachment of attachments) {
       console.log(`📥 Fetching image: ${attachment.name}`);
       const imageResponse = await fetch(
@@ -92,17 +95,15 @@ async function uploadToAdpiler(card, attachments) {
 
       if (labelMeta.type) form.append('type', labelMeta.type);
       if (labelMeta.network) form.append('network', labelMeta.network);
-
       form.append('primary_text', metadata.primaryText);
       form.append('headline', metadata.headline);
       form.append('description', metadata.description);
       form.append('cta', metadata.callToAction);
       form.append('clickthrough_url', metadata.clickthroughUrl);
 
-      const uploadUrl = `${ADPILER_BASE_URL}/campaigns/${mapping.campaignId}/social-ads`;
-      console.log(`📤 Uploading to AdPiler (campaign ${mapping.campaignId})...`);
+      console.log(`📤 Uploading to AdPiler (PNG)...`);
 
-      const uploadResponse = await fetch(uploadUrl, {
+      let uploadResponse = await fetch(uploadUrl, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${ADPILER_API_KEY}`,
@@ -116,7 +117,47 @@ async function uploadToAdpiler(card, attachments) {
         ? await uploadResponse.json()
         : await uploadResponse.text();
 
-      if (!uploadResponse.ok) {
+      if (!uploadResponse.ok && result?.message === 'Server Error') {
+        console.warn(`⚠️ PNG upload failed — retrying as JPEG...`);
+
+        const jpegBuffer = await sharp(buffer).jpeg().toBuffer();
+        const jpegForm = new FormData();
+
+        jpegForm.append('client_id', mapping.clientId);
+        jpegForm.append('name', attachment.name.replace('.png', '.jpg'));
+        jpegForm.append('image', jpegBuffer, {
+          filename: attachment.name.replace('.png', '.jpg'),
+          contentType: 'image/jpeg'
+        });
+
+        if (labelMeta.type) jpegForm.append('type', labelMeta.type);
+        if (labelMeta.network) jpegForm.append('network', labelMeta.network);
+        jpegForm.append('primary_text', metadata.primaryText);
+        jpegForm.append('headline', metadata.headline);
+        jpegForm.append('description', metadata.description);
+        jpegForm.append('cta', metadata.callToAction);
+        jpegForm.append('clickthrough_url', metadata.clickthroughUrl);
+
+        const retryResponse = await fetch(uploadUrl, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${ADPILER_API_KEY}`,
+            ...jpegForm.getHeaders()
+          },
+          body: jpegForm
+        });
+
+        const retryContent = retryResponse.headers.get('content-type');
+        const retryResult = retryContent?.includes('application/json')
+          ? await retryResponse.json()
+          : await retryResponse.text();
+
+        if (!retryResponse.ok) {
+          console.error(`❌ JPEG fallback also failed:`, retryResult);
+        } else {
+          console.log(`✅ JPEG uploaded after PNG failed: ${attachment.name}`);
+        }
+      } else if (!uploadResponse.ok) {
         console.error(`❌ Upload failed:`, result);
       } else {
         console.log(`✅ Uploaded slide: ${attachment.name}`);
