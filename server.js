@@ -1,9 +1,13 @@
+// server.js
 const express = require('express');
 const bodyParser = require('body-parser');
 const dotenv = require('dotenv');
 const fetch = require('node-fetch');
 
 dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 10000;
 
 // --- Simple in-process queue & cooldown to avoid Browserless 429s ---
 const jobQueue = [];
@@ -25,9 +29,6 @@ async function processQueue() {
 }
 const lastRun = new Map();
 const COOLDOWN_MS = 2 * 60 * 1000;
-
-const app = express();
-const PORT = process.env.PORT || 10000;
 
 // Normalize helper (case/space tolerant)
 const normalize = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
@@ -95,37 +96,45 @@ app.post('/trello-webhook', async (req, res) => {
     const card = await getFullCard(cardId);
     console.log(`🗂️  Card "${card.name}" with ${card.attachments?.length || 0} attachment(s).`);
 
-    let result = null;
+    // cooldown per card
     const prev = lastRun.get(cardId) || 0;
     const now = Date.now();
-    if (now - prev < COOLDOWN_MS) { console.log(`⏳ Skip duplicate for ${cardId} (cooldown)`); return; }
-    lastRun.set(cardId, now);
-    await enqueueJob(async () => {
-    if (UPLOAD_MODE === 'api' && uploadApi?.uploadToAdpiler) {
-      console.log('🚀 Using API uploader...');
-      result = await uploadApi.uploadToAdpiler(card, card.attachments, { postTrelloComment });
-    } else if (UPLOAD_MODE === 'ui' && uploadUI?.uploadToAdpilerUI) {
-      console.log('🧭 Using UI uploader (Browserless/Puppeteer)...');
-      result = await uploadUI.uploadToAdpilerUI(card, card.attachments, { postTrelloComment });
-    } else {
-      console.error('❌ No uploader available. Ensure ADPILER_UPLOAD_MODE=ui or api and the corresponding file exists.');
+    if (now - prev < COOLDOWN_MS) {
+      console.log(`⏳ Skip duplicate for ${cardId} (cooldown)`);
       return;
     }
+    lastRun.set(cardId, now);
 
-    const urls = result?.previewUrls || [];
-    if (urls.length) {
-      console.log('✅ Upload complete. Preview URLs:', urls);
-      await postTrelloComment(cardId, `Uploaded to AdPiler:\n${urls.join('\n')}`);
-    } else {
-      console.log('✅ Upload complete (no preview URLs returned).');
-      await postTrelloComment(cardId, 'Uploaded to AdPiler.');
+    // enqueue one-at-a-time
+    await enqueueJob(async () => {
+      let result = null;
+
+      if (UPLOAD_MODE === 'api' && uploadApi?.uploadToAdpiler) {
+        console.log('🚀 Using API uploader...');
+        result = await uploadApi.uploadToAdpiler(card, card.attachments, { postTrelloComment });
+      } else if (UPLOAD_MODE === 'ui' && uploadUI?.uploadToAdpilerUI) {
+        console.log('🧭 Using UI uploader (Browserless/Puppeteer)...');
+        result = await uploadUI.uploadToAdpilerUI(card, card.attachments, { postTrelloComment });
+      } else {
+        throw new Error('No uploader available. Ensure ADPILER_UPLOAD_MODE=ui or api and the corresponding file exists.');
+      }
+
+      const urls = result?.previewUrls || [];
+      if (urls.length) {
+        console.log('✅ Upload complete. Preview URLs:', urls);
+        await postTrelloComment(cardId, `Uploaded to AdPiler:\n${urls.join('\n')}`);
+      } else {
+        console.log('✅ Upload complete (no preview URLs returned).');
+        await postTrelloComment(cardId, 'Uploaded to AdPiler.');
+      }
     });
-    }
+
   } catch (e) {
     console.error('💥 Webhook handler error:', e);
   }
 });
 
+// Start server
 app.listen(PORT, () => {
   console.log(`🌐 Server running on port ${PORT} (mode: ${UPLOAD_MODE})`);
 });
