@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const bodyParser = require('body-parser');
 const dotenv = require('dotenv');
@@ -7,28 +8,32 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+
+// List name filter (case-insensitive). Change via env if your list is different.
 const READY_LIST_NAME = (process.env.READY_LIST_NAME || 'Ready For AdPiler').toLowerCase();
+
+// Mode switch: 'ui' uses upload-to-adpiler-ui.js; 'api' uses upload-to-adpiler.js
 const UPLOAD_MODE = (process.env.ADPILER_UPLOAD_MODE || 'ui').toLowerCase();
 
 let uploadApi, uploadUI;
-try { uploadApi = require('./upload-to-adpiler'); } catch(_) {}
-try { uploadUI = require('./upload-to-adpiler-ui'); } catch(_) {}
+try { uploadApi = require('./upload-to-adpiler'); } catch (_) {}
+try { uploadUI = require('./upload-to-adpiler-ui'); } catch (_) {}
 
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '5mb' }));
 
-// Trello webhook handshake
-app.head('/trello-webhook', (req, res) => res.sendStatus(200));
-app.get('/trello-webhook', (req, res) => res.status(200).send('OK'));
+// --- Basic health/handshake routes ---
+app.get('/', (_req, res) => res.status(200).send(`✅ Trello → AdPiler is running (mode: ${UPLOAD_MODE})`));
+// Trello verifies webhooks via HEAD/GET
+app.head('/trello-webhook', (_req, res) => res.sendStatus(200));
+app.get('/trello-webhook', (_req, res) => res.status(200).send('OK'));
 
-// Health
-app.get('/', (req, res) => res.send(`✅ Trello → AdPiler is running (mode: ${UPLOAD_MODE})`));
-
-// Helpers
+// --- Helpers ---
 async function getFullCard(cardId) {
-  const base = `https://api.trello.com/1/cards/${cardId}`;
   const auth = `key=${process.env.TRELLO_API_KEY}&token=${process.env.TRELLO_TOKEN}`;
+  const base = `https://api.trello.com/1/cards/${cardId}`;
 
-  const fieldsRes = await fetch(`${base}?fields=name,desc,idList&customFieldItems=true&${auth}`);
+  const fieldsUrl = `${base}?fields=name,desc,idList&customFieldItems=true&${auth}`;
+  const fieldsRes = await fetch(fieldsUrl);
   if (!fieldsRes.ok) throw new Error(`Failed to fetch card fields (${fieldsRes.status})`);
   const card = await fieldsRes.json();
 
@@ -42,47 +47,61 @@ async function getFullCard(cardId) {
 }
 
 async function postTrelloComment(cardId, text) {
-  const base = `https://api.trello.com/1/cards/${cardId}/actions/comments`;
   const auth = `key=${process.env.TRELLO_API_KEY}&token=${process.env.TRELLO_TOKEN}`;
-  await fetch(`${base}?${auth}&text=${encodeURIComponent(text)}`, { method: 'POST' });
+  const url = `https://api.trello.com/1/cards/${cardId}/actions/comments?${auth}&text=${encodeURIComponent(text)}`;
+  await fetch(url, { method: 'POST' }).catch(e => console.error('Comment post failed:', e.message));
 }
 
-// Webhook handler
+// --- Webhook handler ---
 app.post('/trello-webhook', async (req, res) => {
-  res.sendStatus(200); // ack fast
+  // Ack *immediately* so Trello doesn’t disable the webhook
+  res.sendStatus(200);
 
   try {
-    const action = req.body && req.body.action;
-    if (!action) return;
+    // Log raw event (trimmed)
+    const type = req.body?.action?.type;
+    const listAfter = req.body?.action?.data?.listAfter?.name;
+    const cardId = req.body?.action?.data?.card?.id;
+    console.log(`📬 Webhook: type=${type || 'n/a'} listAfter=${listAfter || 'n/a'} cardId=${cardId || 'n/a'}`);
 
-    if (action.type === 'updateCard' && action.data && action.data.listAfter) {
-      const listAfterName = (action.data.listAfter.name || '').toLowerCase();
-      if (listAfterName === READY_LIST_NAME) {
-        const cardId = action.data.card.id;
-        const card = await getFullCard(cardId);
+    if (type !== 'updateCard' || !listAfter || !cardId) return;
 
-        let result = null;
-        if (UPLOAD_MODE === 'api' && uploadApi?.uploadToAdpiler) {
-          result = await uploadApi.uploadToAdpiler(card, card.attachments, { postTrelloComment });
-        } else if (UPLOAD_MODE === 'ui' && uploadUI?.uploadToAdpilerUI) {
-          result = await uploadUI.uploadToAdpilerUI(card, card.attachments, { postTrelloComment });
-        } else {
-          console.error('No upload mode available. Set ADPILER_UPLOAD_MODE to "ui" or "api".');
-          return;
-        }
+    const movedTo = (listAfter || '').toLowerCase();
+    if (movedTo !== READY_LIST_NAME) {
+      console.log(`↪️  Ignored (moved to "${listAfter}", expecting "${READY_LIST_NAME}")`);
+      return;
+    }
 
-        if (result?.previewUrls?.length) {
-          await postTrelloComment(cardId, `Uploaded to AdPiler:\n${result.previewUrls.join('\n')}`);
-        } else {
-          await postTrelloComment(cardId, `Uploaded to AdPiler.`);
-        }
-      }
+    console.log(`➡️  Card moved to "${READY_LIST_NAME}": ${cardId} — fetching card details...`);
+    const card = await getFullCard(cardId);
+    console.log(`🗂️  Card "${card.name}" with ${card.attachments?.length || 0} attachment(s).`);
+
+    let result = null;
+    if (UPLOAD_MODE === 'api' && uploadApi?.uploadToAdpiler) {
+      console.log('🚀 Using API uploader...');
+      result = await uploadApi.uploadToAdpiler(card, card.attachments, { postTrelloComment });
+    } else if (UPLOAD_MODE === 'ui' && uploadUI?.uploadToAdpilerUI) {
+      console.log('🧭 Using UI uploader (Browserless/Puppeteer)...');
+      result = await uploadUI.uploadToAdpilerUI(card, card.attachments, { postTrelloComment });
+    } else {
+      console.error('❌ No uploader available. Ensure ADPILER_UPLOAD_MODE=ui or api and the corresponding file exists.');
+      return;
+    }
+
+    const urls = result?.previewUrls || [];
+    if (urls.length) {
+      console.log('✅ Upload complete. Preview URLs:', urls);
+      await postTrelloComment(cardId, `Uploaded to AdPiler:\n${urls.join('\n')}`);
+    } else {
+      console.log('✅ Upload complete (no preview URLs returned).');
+      await postTrelloComment(cardId, 'Uploaded to AdPiler.');
     }
   } catch (e) {
-    console.error('Webhook handler error:', e);
+    console.error('💥 Webhook handler error:', e);
   }
 });
 
+// --- Start server ---
 app.listen(PORT, () => {
   console.log(`🌐 Server running on port ${PORT} (mode: ${UPLOAD_MODE})`);
 });
