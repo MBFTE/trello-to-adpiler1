@@ -1,6 +1,4 @@
-// upload-to-adpiler-ui.js
-// Browserless/Playwright UI automation for Trello → AdPiler
-
+// Browserless/puppeteer UI automation for Trello → AdPiler
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -14,14 +12,13 @@ const {
   CLIENT_CSV_URL,
   ADPILER_USER,
   ADPILER_PASS,
-  ADPILER_LOGIN_URL, // e.g. https://platform.adpiler.com/login
-  ADPILER_BASE_URL,  // optional: base URL for tenant
+  ADPILER_LOGIN_URL, // e.g., https://platform.adpiler.com/login
+  ADPILER_BASE_URL,  // optional base, e.g., https://platform.adpiler.com
   BROWSERLESS_WS_URL,
   BROWSERLESS_URL,
-  BROWSERLESS_TOKEN
+  BROWSERLESS_TOKEN,
+  DEBUG_UI
 } = process.env;
-
-// --------- Helpers ---------
 
 function wsEndpoint() {
   if (BROWSERLESS_WS_URL) return BROWSERLESS_WS_URL;
@@ -31,7 +28,7 @@ function wsEndpoint() {
     u.searchParams.set('token', BROWSERLESS_TOKEN);
     return u.toString();
   }
-  throw new Error('Missing Browserless endpoint. Set BROWSERLESS_WS_URL or BROWSERLESS_URL + BROWSERLESS_TOKEN');
+  throw new Error('Missing Browserless endpoint (BROWSERLESS_WS_URL or BROWSERLESS_URL + BROWSERLESS_TOKEN).');
 }
 
 async function getClientMapping(cardName) {
@@ -77,7 +74,7 @@ async function clickByText(page, text) {
   await el.click();
 }
 
-// --------- Main ---------
+async function logStep(msg) { if (DEBUG_UI) console.log(`🔎 UI: ${msg}`); }
 
 async function uploadToAdpilerUI(card, attachments, { postTrelloComment } = {}) {
   if (!ADPILER_USER || !ADPILER_PASS) throw new Error('Missing ADPILER_USER/ADPILER_PASS');
@@ -91,11 +88,11 @@ async function uploadToAdpilerUI(card, attachments, { postTrelloComment } = {}) 
   const mapping = await getClientMapping(card.name);
 
   const tmpFiles = [];
-
   try {
-    // 1) Login
+    await logStep('Navigating to login');
     await page.goto(ADPILER_LOGIN_URL, { waitUntil: 'networkidle2' });
 
+    await logStep('Typing credentials');
     await page.type('input[type="email"], input[name="email"]', ADPILER_USER, { delay: 10 });
     await page.type('input[type="password"], input[name="password"]', ADPILER_PASS, { delay: 10 });
     await Promise.all([
@@ -103,30 +100,29 @@ async function uploadToAdpilerUI(card, attachments, { postTrelloComment } = {}) 
       page.waitForNavigation({ waitUntil: 'networkidle2' })
     ]);
 
-    // 2) Navigate to client/project
-    // TODO: adjust to your AdPiler tenant's UI flow
-    if (ADPILER_BASE_URL && mapping.clientId) {
-      // Example:
-      // await page.goto(`${ADPILER_BASE_URL}/clients/${mapping.clientId}`, { waitUntil: 'networkidle2' });
-    }
+    // Navigate to client/project if you have a deterministic URL structure in your tenant.
+    // Example (adjust/enable if your tenant supports direct client URL):
+    // if (ADPILER_BASE_URL && mapping.clientId) {
+    //   await logStep(`Opening client ${mapping.clientId}`);
+    //   await page.goto(`${ADPILER_BASE_URL}/clients/${mapping.clientId}`, { waitUntil: 'networkidle2' });
+    // }
 
-    // 3) Start "New Ad" or upload
+    await logStep('Opening New Ad / Upload flow');
     try { await clickByText(page, 'New Ad'); } catch { await clickByText(page, 'Upload'); }
     await page.waitForSelector('input[type="file"], input[name="headline"], input[name="title"]', { timeout: 30000 });
 
-    // 4) Upload files
-    const fileInput = await page.$('input[type="file"]');
+    await logStep('Downloading attachments');
     for (const att of (attachments || [])) {
       if (!att.id) continue;
       const tmp = await downloadAttachmentToTemp(att.id, att.name || `asset-${att.id}`);
       tmpFiles.push(tmp);
     }
-    if (fileInput && tmpFiles.length) {
-      await fileInput.uploadFile(...tmpFiles);
-    }
 
-    // 5) Fill metadata
-    async function setIfExists(selectors, value) {
+    await logStep(`Uploading ${tmpFiles.length} file(s)`);
+    const fileInput = await page.$('input[type="file"]');
+    if (fileInput && tmpFiles.length) await fileInput.uploadFile(...tmpFiles);
+
+    const setIfExists = async (selectors, value) => {
       if (!value) return;
       for (const sel of selectors) {
         const el = await page.$(sel);
@@ -136,25 +132,34 @@ async function uploadToAdpilerUI(card, attachments, { postTrelloComment } = {}) 
           return;
         }
       }
-    }
+    };
 
+    await logStep('Filling metadata fields');
     await setIfExists(['input[name="headline"]','input[name="title"]','input[placeholder*="Headline"]'], meta.headline);
     await setIfExists(['textarea[name="description"]','textarea[placeholder*="Description"]'], meta.description);
     await setIfExists(['input[name="cta"]','input[placeholder*="CTA"]'], meta.cta);
     await setIfExists(['input[name="url"]','input[name="click_url"]','input[placeholder*="URL"]'], meta.url);
 
-    // 6) Submit
+    await logStep('Submitting');
     try { await clickByText(page, 'Create'); } catch { await clickByText(page, 'Save'); }
 
-    // 7) Grab preview URLs
     await page.waitForTimeout(1500);
     const anchors = await page.$$eval('a', as => as.map(a => a.href).filter(Boolean));
     const previewUrls = anchors.filter(u => /preview|share/i.test(u));
 
-    // Cleanup temp files
+    await logStep(`Done. Found ${previewUrls.length} preview URL(s).`);
     tmpFiles.forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
 
     return { previewUrls };
+  } catch (err) {
+    if (DEBUG_UI) {
+      try {
+        const shot = path.join(os.tmpdir(), `adpiler-ui-fail-${Date.now()}.png`);
+        await page.screenshot({ path: shot, fullPage: true });
+        console.error('UI failed. Screenshot saved at:', shot);
+      } catch (_) {}
+    }
+    throw err;
   } finally {
     await page.close().catch(() => {});
     await browser.disconnect();
