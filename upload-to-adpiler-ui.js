@@ -80,7 +80,7 @@ async function uploadToAdpilerUI(card, attachments, { postTrelloComment } = {}) 
   if (!ADPILER_USER || !ADPILER_PASS) throw new Error('Missing ADPILER_USER/ADPILER_PASS');
   if (!ADPILER_LOGIN_URL) throw new Error('Missing ADPILER_LOGIN_URL');
 
-  const browser = await puppeteer.connect({ browserWSEndpoint: wsEndpoint() });
+  const browser = await connectWithRetry(wsEndpoint());
   const page = await browser.newPage();
   page.setDefaultTimeout(45000);
 
@@ -164,6 +164,26 @@ async function uploadToAdpilerUI(card, attachments, { postTrelloComment } = {}) 
     await page.close().catch(() => {});
     await browser.disconnect();
   }
+}
+
+
+async function connectWithRetry(wsEndpoint, attempts = 5) {
+  let delay = 2000;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await puppeteer.connect({ browserWSEndpoint: wsEndpoint });
+    } catch (e) {
+      const msg = String(e && (e.message || e));
+      if (msg.includes('429') || msg.includes('Too Many Requests')) {
+        console.warn(`Browserless 429; retrying in ${delay}ms (attempt ${i}/${attempts})`);
+        await new Promise(r => setTimeout(r, delay));
+        delay = Math.min(delay * 2, 15000);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw new Error('Failed to connect to Browserless after retries');
 }
 
 module.exports = { uploadToAdpilerUI };

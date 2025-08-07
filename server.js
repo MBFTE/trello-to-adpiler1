@@ -5,6 +5,27 @@ const fetch = require('node-fetch');
 
 dotenv.config();
 
+// --- Simple in-process queue & cooldown to avoid Browserless 429s ---
+const jobQueue = [];
+let processing = false;
+async function enqueueJob(fn) {
+  return new Promise((resolve, reject) => {
+    jobQueue.push({ fn, resolve, reject });
+    processQueue();
+  });
+}
+async function processQueue() {
+  if (processing) return;
+  processing = true;
+  while (jobQueue.length) {
+    const { fn, resolve, reject } = jobQueue.shift();
+    try { resolve(await fn()); } catch (e) { reject(e); }
+  }
+  processing = false;
+}
+const lastRun = new Map();
+const COOLDOWN_MS = 2 * 60 * 1000;
+
 const app = express();
 const PORT = process.env.PORT || 10000;
 
@@ -75,6 +96,11 @@ app.post('/trello-webhook', async (req, res) => {
     console.log(`🗂️  Card "${card.name}" with ${card.attachments?.length || 0} attachment(s).`);
 
     let result = null;
+    const prev = lastRun.get(cardId) || 0;
+    const now = Date.now();
+    if (now - prev < COOLDOWN_MS) { console.log(`⏳ Skip duplicate for ${cardId} (cooldown)`); return; }
+    lastRun.set(cardId, now);
+    await enqueueJob(async () => {
     if (UPLOAD_MODE === 'api' && uploadApi?.uploadToAdpiler) {
       console.log('🚀 Using API uploader...');
       result = await uploadApi.uploadToAdpiler(card, card.attachments, { postTrelloComment });
@@ -93,6 +119,7 @@ app.post('/trello-webhook', async (req, res) => {
     } else {
       console.log('✅ Upload complete (no preview URLs returned).');
       await postTrelloComment(cardId, 'Uploaded to AdPiler.');
+    });
     }
   } catch (e) {
     console.error('💥 Webhook handler error:', e);
