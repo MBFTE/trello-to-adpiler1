@@ -1,23 +1,23 @@
 /**
- * Trello → AdPiler (API path, no new env needed)
+ * Trello → AdPiler (API path, resilient)
  *
  * CREATE (multipart):
  *   POST /campaigns/{campaign}/social-ads
- *   form fields:
+ *   fields:
  *     - name (string)
  *     - network (string)   ← fixed "facebook"
  *     - type (string)      ← fixed "post"
  *     - page_name (string) ← derived from card, fallback "Adpiler"
- *     - logo (binary)      ← optional (not sent by default)
+ *     - logo (binary)      ← optional (disabled by default)
  *
- * SLIDES (multipart, per file):
+ * SLIDES (multipart per file):
  *   POST /social-ads/{ad}/slides
- *   form fields:
- *     - call_to_action (string)
- *     - display_link (string)
- *     - headline (string)
- *     - description (string)
- *     - landing_page_url (string)
+ *   fields:
+ *     - call_to_action
+ *     - display_link
+ *     - headline
+ *     - description
+ *     - landing_page_url
  *     - media_file (binary)
  *
  * CSV headers expected:
@@ -26,14 +26,14 @@
  *  - "Adpiler Folder ID"
  *  - "Adpiler Campaign ID"  ← used as {campaign}
  *
- * REQUIRED ENV (already in your Render):
+ * REQUIRED ENV (you already have these):
  *  - ADPILER_API_BASE=https://platform.adpiler.com/api   (or ADPILER_BASE_URL)
  *  - ADPILER_API_KEY=...     (Bearer)
  *  - CLIENT_CSV_URL=https://.../pub?output=csv  (or set DEFAULT_CLIENT_ID/DEFAULT_PROJECT_ID)
  *  - TRELLO_API_KEY=...
  *  - TRELLO_TOKEN=...
- *  - DEFAULT_CLIENT_ID (optional fallback)
- *  - DEFAULT_PROJECT_ID (optional fallback → campaignId)
+ *  - DEFAULT_CLIENT_ID (optional)
+ *  - DEFAULT_PROJECT_ID (optional → campaignId)
  */
 
 const fetch = require('node-fetch');
@@ -54,7 +54,7 @@ const {
   TRELLO_TOKEN,
   DEFAULT_CLIENT_ID = '',
   DEFAULT_PROJECT_ID = '',
-  // We still accept ADPILER_API_BASE or ADPILER_BASE_URL from your current env
+  // ADPILER_API_BASE or ADPILER_BASE_URL provided in your env
 } = process.env;
 
 // Accept either ADPILER_API_BASE or ADPILER_BASE_URL
@@ -117,12 +117,39 @@ async function getClientMapping(cardName) {
 
 // ---------- TRELLO HELPERS ----------
 async function downloadAttachmentBuffer(attachmentId) {
-  const auth = `key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
-  const url = `https://api.trello.com/1/attachments/${attachmentId}/download?${auth}`;
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`Attachment ${attachmentId} download failed (${r.status})`);
-  const ab = await r.arrayBuffer();
-  return Buffer.from(ab);
+  const authQ = `key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
+
+  // 1) Inspect attachment metadata
+  const metaRes = await fetch(`https://api.trello.com/1/attachments/${attachmentId}?${authQ}`);
+  if (!metaRes.ok) {
+    throw new Error(`Attachment ${attachmentId} metadata fetch failed (${metaRes.status})`);
+  }
+  const meta = await metaRes.json();
+  const isUpload = !!meta.isUpload;
+  const name = meta.name || `asset-${attachmentId}`;
+
+  // 2) Uploaded file → Trello /download
+  if (isUpload) {
+    const dl = await fetch(`https://api.trello.com/1/attachments/${attachmentId}/download?${authQ}`);
+    if (!dl.ok) {
+      throw new Error(`Attachment ${attachmentId} Trello download failed (${dl.status})`);
+    }
+    const ab = await dl.arrayBuffer();
+    return { buffer: Buffer.from(ab), filename: name };
+  }
+
+  // 3) External link → fetch meta.url (must be public)
+  const externalUrl = meta.url;
+  if (!externalUrl) {
+    throw new Error(`Attachment ${attachmentId} is not an uploaded file and has no url`);
+  }
+
+  const extRes = await fetch(externalUrl, { redirect: 'follow' });
+  if (!extRes.ok) {
+    throw new Error(`Attachment ${attachmentId} external fetch failed (${extRes.status}) for ${externalUrl}`);
+  }
+  const ab = await extRes.arrayBuffer();
+  return { buffer: Buffer.from(ab), filename: name };
 }
 
 function extractAdMetaFromCard(card) {
@@ -152,7 +179,7 @@ function extractAdMetaFromCard(card) {
 }
 
 function derivePageName(cardName) {
-  // Use prefix before ":" if present; else fallback to default
+  // Use prefix before ":" if present; else fallback
   const m = cardName.split(':')[0].trim();
   return m || DEFAULT_PAGE_NAME;
 }
@@ -234,7 +261,7 @@ async function postForm(path, form, maxAttempts = 4) {
 }
 
 // ---------- ADPILER API STEPS ----------
-async function createSocialAd({ campaignId, card /*, attachments */ }) {
+async function createSocialAd({ campaignId, card /*, attachments*/ }) {
   // Per your tenant schema: name + fixed network/type + page_name (multipart)
   const form = new FormData();
 
@@ -248,15 +275,13 @@ async function createSocialAd({ campaignId, card /*, attachments */ }) {
   form.append('type', type);
   form.append('page_name', pageName);
 
-  // NOTE: We are NOT attaching "logo" by default.
-  // If you want to attach a logo, uncomment below to send the first attachment as "logo".
+  // Optional: attach logo from first attachment (disabled by default)
   /*
   if (attachments && attachments.length) {
     try {
       const first = attachments[0];
-      const buf = await downloadAttachmentBuffer(first.id);
-      const filename = first.name || `logo-${first.id}`;
-      form.append('logo', buf, { filename });
+      const { buffer, filename } = await downloadAttachmentBuffer(first.id);
+      form.append('logo', buffer, { filename: filename || `logo-${first.id}` });
     } catch (e) {
       console.warn('Could not attach logo from card:', e.message);
     }
@@ -267,7 +292,9 @@ async function createSocialAd({ campaignId, card /*, attachments */ }) {
   const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
 
   const adId = json.id || json.adId || json.data?.id;
-  if (!adId) throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
+  if (!adId) {
+    throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
+  }
   return { adId, raw: json };
 }
 
@@ -301,15 +328,33 @@ async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
 }
 
 async function uploadSlides({ adId, attachments, meta }) {
-  const all = [];
+  const allPreviewUrls = [];
+  let successCount = 0;
+  let triedCount = 0;
+
   for (const att of attachments || []) {
     if (!att || !att.id) continue;
-    const buf = await downloadAttachmentBuffer(att.id);
-    const filename = att.name || `asset-${att.id}`;
-    const urls = await uploadOneSlide({ adId, fileBuf: buf, filename, meta });
-    all.push(...urls);
+    triedCount++;
+    try {
+      const { buffer, filename } = await downloadAttachmentBuffer(att.id);
+      const urls = await uploadOneSlide({
+        adId,
+        fileBuf: buffer,
+        filename: filename || `asset-${att.id}`,
+        meta
+      });
+      allPreviewUrls.push(...(urls || []));
+      successCount++;
+    } catch (e) {
+      console.warn(`⚠️ Skipping attachment ${att.id} (${att.name || ''}): ${e.message}`);
+    }
   }
-  return { previewUrls: all };
+
+  if (triedCount > 0 && successCount === 0) {
+    throw new Error('None of the card attachments could be fetched. Ensure at least one attachment is an uploaded file in Trello or a publicly accessible link.');
+  }
+
+  return { previewUrls: allPreviewUrls };
 }
 
 // ---------- MAIN ENTRY ----------
@@ -340,4 +385,5 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
 }
 
 module.exports = { uploadToAdpiler };
+
 
