@@ -1,24 +1,25 @@
 /**
- * Trello → AdPiler (API path)
- * Flow:
- *  1) Create Social Ad: POST /campaigns/{campaignId}/social-ads
- *  2) Upload Slides:    POST /social-ads/{adId}/slides (multipart)
+ * Trello → AdPiler (API path) with required fields
+ *  1) POST /campaigns/{campaignId}/social-ads  (now includes: network, type)
+ *  2) POST /social-ads/{adId}/slides           (multipart files[] by default)
  *
- * CSV headers expected (per your sheet):
+ * CSV headers expected:
  *  - "Trello Client Name"
  *  - "Adpiler Client ID"
  *  - "Adpiler Folder ID"
- *  - "Adpiler Campaign ID"
+ *  - "Adpiler Campaign ID"  ← used as {campaign}
  *
- * ENV (Render):
- *  - ADPILER_UPLOAD_MODE=api        ← make sure this is set
+ * ENV:
+ *  - ADPILER_UPLOAD_MODE=api
  *  - ADPILER_API_BASE=https://platform.adpiler.com/api   (or ADPILER_BASE_URL)
- *  - ADPILER_API_KEY=...            (Bearer)
+ *  - ADPILER_API_KEY=...   (Bearer)
  *  - CLIENT_CSV_URL=https://.../pub?output=csv
  *  - TRELLO_API_KEY=...
  *  - TRELLO_TOKEN=...
  *  - DEFAULT_CLIENT_ID=69144        (optional fallback)
- *  - DEFAULT_PROJECT_ID=445479      (optional fallback, used as campaignId)
+ *  - DEFAULT_PROJECT_ID=445479      (optional fallback; used as campaign)
+ *  - ADPILER_DEFAULT_NETWORK=facebook   (fallback if not on card)
+ *  - ADPILER_DEFAULT_TYPE=carousel      (fallback if not on card)
  */
 
 const fetch = require('node-fetch');
@@ -33,6 +34,8 @@ const {
   TRELLO_TOKEN,
   DEFAULT_CLIENT_ID = '',
   DEFAULT_PROJECT_ID = '',
+  ADPILER_DEFAULT_NETWORK = '',
+  ADPILER_DEFAULT_TYPE = '',
 } = process.env;
 
 // Accept either ADPILER_API_BASE or ADPILER_BASE_URL
@@ -55,11 +58,10 @@ const n = (s) => (s || '').toLowerCase().trim();
 async function getClientMapping(cardName /*, listName? */) {
   const fallback = {
     clientId: String(DEFAULT_CLIENT_ID || '').trim(),
-    campaignId: String(DEFAULT_PROJECT_ID || '').trim(), // your sheet calls this “Adpiler Campaign ID”
+    campaignId: String(DEFAULT_PROJECT_ID || '').trim(),
     folderId: '',
   };
 
-  // If no CSV, fall back (if provided)
   if (!CLIENT_CSV_URL) {
     if (fallback.clientId) {
       return { clientId: fallback.clientId, projectId: fallback.campaignId, folderId: '', campaignId: fallback.campaignId };
@@ -71,7 +73,6 @@ async function getClientMapping(cardName /*, listName? */) {
   if (!res.ok) throw new Error(`Mapping CSV fetch failed (${res.status})`);
   const rows = await csv().fromString(await res.text());
 
-  // Primary match: card title contains "Trello Client Name"
   const row = rows.find(r => n(cardName).includes(n(r['Trello Client Name'])));
 
   if (row) {
@@ -80,7 +81,6 @@ async function getClientMapping(cardName /*, listName? */) {
     const campaignId = String(row['Adpiler Campaign ID'] || '').trim();
     if (clientId) return { clientId, projectId: campaignId, folderId, campaignId };
 
-    // Row matched but missing clientId → fallback (if available)
     if (fallback.clientId) {
       console.warn(`CSV row for "${cardName}" missing Adpiler Client ID; using DEFAULT_CLIENT_ID.`);
       return { clientId: fallback.clientId, projectId: fallback.campaignId, folderId: '', campaignId: fallback.campaignId };
@@ -88,7 +88,6 @@ async function getClientMapping(cardName /*, listName? */) {
     throw new Error(`Mapping row missing Adpiler Client ID for "${row['Trello Client Name'] || cardName}"`);
   }
 
-  // No row matched → fallback (if available)
   if (fallback.clientId) {
     console.warn(`No CSV match for "${cardName}". Falling back to DEFAULT_CLIENT_ID.`);
     return { clientId: fallback.clientId, projectId: fallback.campaignId, folderId: '', campaignId: fallback.campaignId };
@@ -113,12 +112,61 @@ function extractAdMetaFromCard(card) {
     const m = desc.match(new RegExp(`${label}:\\s*(.+)`, 'i'));
     return m ? m[1].trim() : '';
   };
+
+  // Pull network/type from description if present
+  // e.g., "Network: Facebook"  "Type: Carousel"
+  const networkFromDesc = grab('Network');
+  const typeFromDesc    = grab('Type');
+
   return {
-    headline: grab('Headline'),
+    headline:    grab('Headline'),
     description: grab('Description'),
-    cta: grab('CTA'),
-    url: grab('URL')
+    cta:         grab('CTA'),
+    url:         grab('URL'),
+    networkHint: networkFromDesc,
+    typeHint:    typeFromDesc
   };
+}
+
+function inferNetwork({ card, meta }) {
+  const text = `${card.name} ${card.desc} ${(card.labels || []).map(l => l.name).join(' ')}`.toLowerCase();
+  const map = [
+    { k: ['facebook','fb','meta'], v: 'facebook' },
+    { k: ['instagram','ig'], v: 'instagram' },
+    { k: ['tiktok'], v: 'tiktok' },
+    { k: ['linkedin','li'], v: 'linkedin' },
+    { k: ['pinterest','pin'], v: 'pinterest' },
+    { k: ['snapchat','snap'], v: 'snapchat' },
+    { k: ['twitter','x '], v: 'twitter' }, // include 'x ' with space to avoid matching words with x
+  ];
+
+  // 1) Explicit hint in description trumps everything
+  if (meta.networkHint) return meta.networkHint.toLowerCase();
+
+  // 2) Infer from labels/name/desc
+  for (const m of map) {
+    if (m.k.some(k => text.includes(k))) return m.v;
+  }
+
+  // 3) Fallback to env default
+  return (ADPILER_DEFAULT_NETWORK || '').toLowerCase() || 'facebook';
+}
+
+function inferType({ card, meta }) {
+  const text = `${card.name} ${card.desc}`.toLowerCase();
+
+  // 1) Explicit hint in description
+  if (meta.typeHint) return meta.typeHint.toLowerCase();
+
+  // 2) Infer from keywords
+  if (text.includes('carousel')) return 'carousel';
+  if (text.includes('video'))    return 'video';
+  if (text.includes('gif'))      return 'gif';
+  if (text.includes('image'))    return 'image';
+  if (text.includes('static'))   return 'image';
+
+  // 3) Fallback
+  return (ADPILER_DEFAULT_TYPE || '').toLowerCase() || 'image';
 }
 
 // ---------- HTTP HELPERS (with retries) ----------
@@ -199,20 +247,25 @@ async function postForm(path, form, maxAttempts = 4) {
 
 // ---------- ADPILER API STEPS ----------
 async function createSocialAd({ campaignId, card, meta }) {
-  // Adjust these keys if your API requires different names
+  const network = inferNetwork({ card, meta });
+  const type    = inferType({ card, meta });
+
   const payload = {
-    name: card.name,
-    headline: meta.headline || '',
-    description: meta.description || '',
-    cta: meta.cta || '',
-    click_url: meta.url || ''
+    name:       card.name,
+    headline:   meta.headline || '',
+    description:meta.description || '',
+    cta:        meta.cta || '',
+    click_url:  meta.url || '',
+    network,    // REQUIRED by API
+    type        // REQUIRED by API
   };
+
+  console.log(`Creating social ad → campaign=${campaignId}, network=${network}, type=${type}`);
 
   // POST /campaigns/{campaign}/social-ads
   const path = `campaigns/${encodeURIComponent(campaignId)}/social-ads`;
   const json = await postJSON(path, payload);
 
-  // Extract the new ad id (adjust keys if your API differs)
   const adId = json.id || json.adId || json.data?.id;
   if (!adId) {
     throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
@@ -221,7 +274,6 @@ async function createSocialAd({ campaignId, card, meta }) {
 }
 
 async function uploadSlides({ adId, attachments }) {
-  // POST /social-ads/{ad}/slides  (multipart)
   const form = new FormData();
   let count = 0;
 
@@ -229,7 +281,7 @@ async function uploadSlides({ adId, attachments }) {
     if (!att || !att.id) continue;
     const buf = await downloadAttachmentBuffer(att.id);
     const filename = att.name || `asset-${att.id}`;
-    // Many APIs accept multiple files as "files[]"; if AdPiler expects "slides" or "file", change here:
+    // If your API wants "slides[]" or "file", change the field name here:
     form.append('files[]', buf, { filename });
     count++;
   }
@@ -242,7 +294,6 @@ async function uploadSlides({ adId, attachments }) {
   const path = `social-ads/${encodeURIComponent(adId)}/slides`;
   const json = await postForm(path, form);
 
-  // Try to collect any preview/share links
   const previewUrls = [];
   const push = (v) => { if (v && typeof v === 'string') previewUrls.push(v); };
 
@@ -263,20 +314,15 @@ async function uploadSlides({ adId, attachments }) {
 async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   assertEnv();
 
-  // 1) Map to AdPiler client/campaign via CSV (or fallbacks)
   const mapping = await getClientMapping(card.name);
   const campaignId = mapping.campaignId || mapping.projectId || DEFAULT_PROJECT_ID;
   if (!campaignId) throw new Error('No campaignId found (CSV "Adpiler Campaign ID" or DEFAULT_PROJECT_ID required)');
 
   const meta = extractAdMetaFromCard(card);
 
-  // 2) Create the Social Ad
   const { adId } = await createSocialAd({ campaignId, card, meta });
-
-  // 3) Upload slides
   const { previewUrls } = await uploadSlides({ adId, attachments });
 
-  // 4) Optional: comment back on Trello
   if (postTrelloComment) {
     const text = previewUrls?.length
       ? `Created AdPiler Social Ad (id: ${adId}) and uploaded ${attachments?.length || 0} slide(s):\n${previewUrls.join('\n')}`
