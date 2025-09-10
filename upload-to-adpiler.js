@@ -1,7 +1,8 @@
 /**
- * Trello → AdPiler (API path) with required fields
- *  1) POST /campaigns/{campaignId}/social-ads  (now includes: network, type)
- *  2) POST /social-ads/{adId}/slides           (multipart files[] by default)
+ * Trello → AdPiler (API path)
+ * Flow:
+ *  1) POST /campaigns/{campaignId}/social-ads  (requires: network, type)
+ *  2) POST /social-ads/{adId}/slides           (multipart)
  *
  * CSV headers expected:
  *  - "Trello Client Name"
@@ -9,7 +10,7 @@
  *  - "Adpiler Folder ID"
  *  - "Adpiler Campaign ID"  ← used as {campaign}
  *
- * ENV:
+ * ENV (Render):
  *  - ADPILER_UPLOAD_MODE=api
  *  - ADPILER_API_BASE=https://platform.adpiler.com/api   (or ADPILER_BASE_URL)
  *  - ADPILER_API_KEY=...   (Bearer)
@@ -17,9 +18,9 @@
  *  - TRELLO_API_KEY=...
  *  - TRELLO_TOKEN=...
  *  - DEFAULT_CLIENT_ID=69144        (optional fallback)
- *  - DEFAULT_PROJECT_ID=445479      (optional fallback; used as campaign)
+ *  - DEFAULT_PROJECT_ID=445479      (optional fallback → campaign)
  *  - ADPILER_DEFAULT_NETWORK=facebook   (fallback if not on card)
- *  - ADPILER_DEFAULT_TYPE=carousel      (fallback if not on card)
+ *  - ADPILER_DEFAULT_TYPE=single_image  (fallback if not on card)
  */
 
 const fetch = require('node-fetch');
@@ -113,8 +114,9 @@ function extractAdMetaFromCard(card) {
     return m ? m[1].trim() : '';
   };
 
-  // Pull network/type from description if present
-  // e.g., "Network: Facebook"  "Type: Carousel"
+  // Optional explicit hints in the card description:
+  // Network: facebook
+  // Type: single_image
   const networkFromDesc = grab('Network');
   const typeFromDesc    = grab('Type');
 
@@ -131,42 +133,28 @@ function extractAdMetaFromCard(card) {
 function inferNetwork({ card, meta }) {
   const text = `${card.name} ${card.desc} ${(card.labels || []).map(l => l.name).join(' ')}`.toLowerCase();
   const map = [
-    { k: ['facebook','fb','meta'], v: 'facebook' },
+    { k: ['facebook','fb','meta '], v: 'facebook' },
     { k: ['instagram','ig'], v: 'instagram' },
     { k: ['tiktok'], v: 'tiktok' },
-    { k: ['linkedin','li'], v: 'linkedin' },
-    { k: ['pinterest','pin'], v: 'pinterest' },
-    { k: ['snapchat','snap'], v: 'snapchat' },
-    { k: ['twitter','x '], v: 'twitter' }, // include 'x ' with space to avoid matching words with x
+    { k: ['linkedin','li '], v: 'linkedin' },
+    { k: ['pinterest','pin '], v: 'pinterest' },
+    { k: ['snapchat','snap '], v: 'snapchat' },
+    { k: ['twitter',' x '], v: 'twitter' },
   ];
 
-  // 1) Explicit hint in description trumps everything
   if (meta.networkHint) return meta.networkHint.toLowerCase();
-
-  // 2) Infer from labels/name/desc
-  for (const m of map) {
-    if (m.k.some(k => text.includes(k))) return m.v;
-  }
-
-  // 3) Fallback to env default
-  return (ADPILER_DEFAULT_NETWORK || '').toLowerCase() || 'facebook';
+  for (const m of map) if (m.k.some(k => text.includes(k))) return m.v;
+  return (ADPILER_DEFAULT_NETWORK || 'facebook').toLowerCase();
 }
 
 function inferType({ card, meta }) {
   const text = `${card.name} ${card.desc}`.toLowerCase();
-
-  // 1) Explicit hint in description
   if (meta.typeHint) return meta.typeHint.toLowerCase();
-
-  // 2) Infer from keywords
   if (text.includes('carousel')) return 'carousel';
   if (text.includes('video'))    return 'video';
   if (text.includes('gif'))      return 'gif';
-  if (text.includes('image'))    return 'image';
-  if (text.includes('static'))   return 'image';
-
-  // 3) Fallback
-  return (ADPILER_DEFAULT_TYPE || '').toLowerCase() || 'image';
+  if (text.includes('static') || text.includes('image')) return 'single_image';
+  return (ADPILER_DEFAULT_TYPE || 'single_image').toLowerCase();
 }
 
 // ---------- HTTP HELPERS (with retries) ----------
@@ -248,29 +236,47 @@ async function postForm(path, form, maxAttempts = 4) {
 // ---------- ADPILER API STEPS ----------
 async function createSocialAd({ campaignId, card, meta }) {
   const network = inferNetwork({ card, meta });
-  const type    = inferType({ card, meta });
+  let type = inferType({ card, meta });
 
-  const payload = {
-    name:       card.name,
-    headline:   meta.headline || '',
-    description:meta.description || '',
-    cta:        meta.cta || '',
-    click_url:  meta.url || '',
-    network,    // REQUIRED by API
-    type        // REQUIRED by API
-  };
+  // Try a sequence of type candidates if API rejects one as invalid
+  const tryTypes = Array.from(new Set([
+    type,
+    (process.env.ADPILER_DEFAULT_TYPE || '').toLowerCase(),
+    // common variants vendors expect
+    'single_image', 'image', 'static', 'single', 'photo',
+    'carousel_ad', 'carousel',
+    'video'
+  ])).filter(Boolean);
 
-  console.log(`Creating social ad → campaign=${campaignId}, network=${network}, type=${type}`);
+  const makePayload = (t) => ({
+    name:        card.name,
+    headline:    meta.headline || '',
+    description: meta.description || '',
+    cta:         meta.cta || '',
+    click_url:   meta.url || '',
+    network,     // REQUIRED by API
+    type: t      // REQUIRED by API
+  });
 
-  // POST /campaigns/{campaign}/social-ads
-  const path = `campaigns/${encodeURIComponent(campaignId)}/social-ads`;
-  const json = await postJSON(path, payload);
-
-  const adId = json.id || json.adId || json.data?.id;
-  if (!adId) {
-    throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
+  let lastErr = null;
+  for (const t of tryTypes) {
+    console.log(`Creating social ad → campaign=${campaignId}, network=${network}, type=${t}`);
+    try {
+      const json = await postJSON(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, makePayload(t));
+      const adId = json.id || json.adId || json.data?.id;
+      if (!adId) throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
+      return { adId, raw: json };
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e && e.message || '').toLowerCase();
+      if (msg.includes('"type"') && msg.includes('invalid')) {
+        console.warn(`Type "${t}" rejected; trying next candidate...`);
+        continue;
+      }
+      throw e;
+    }
   }
-  return { adId, raw: json };
+  throw lastErr || new Error('All type candidates were rejected by AdPiler');
 }
 
 async function uploadSlides({ adId, attachments }) {
