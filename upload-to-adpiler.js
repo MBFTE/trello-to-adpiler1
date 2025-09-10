@@ -1,14 +1,14 @@
 /**
- * Trello → AdPiler (API path)
+ * Trello → AdPiler (API path, no new env needed)
  *
  * CREATE (multipart):
  *   POST /campaigns/{campaign}/social-ads
  *   form fields:
  *     - name (string)
- *     - network (string)     ← enum varies by tenant; allow overrides
- *     - type (string)        ← enum varies by tenant; allow overrides
- *     - page_name (string)   ← optional, can be brand/client page
- *     - logo (binary)        ← optional; we can attach first asset if desired
+ *     - network (string)   ← fixed "facebook"
+ *     - type (string)      ← fixed "post"
+ *     - page_name (string) ← derived from card, fallback "Adpiler"
+ *     - logo (binary)      ← optional (not sent by default)
  *
  * SLIDES (multipart, per file):
  *   POST /social-ads/{ad}/slides
@@ -26,26 +26,14 @@
  *  - "Adpiler Folder ID"
  *  - "Adpiler Campaign ID"  ← used as {campaign}
  *
- * ENV (Render, no quotes):
- *  - ADPILER_UPLOAD_MODE=api
+ * REQUIRED ENV (already in your Render):
  *  - ADPILER_API_BASE=https://platform.adpiler.com/api   (or ADPILER_BASE_URL)
  *  - ADPILER_API_KEY=...     (Bearer)
- *  - CLIENT_CSV_URL=https://.../pub?output=csv
+ *  - CLIENT_CSV_URL=https://.../pub?output=csv  (or set DEFAULT_CLIENT_ID/DEFAULT_PROJECT_ID)
  *  - TRELLO_API_KEY=...
  *  - TRELLO_TOKEN=...
- *  - DEFAULT_CLIENT_ID=69144            (optional fallback)
- *  - DEFAULT_PROJECT_ID=445479          (optional fallback → campaignId)
- *
- *  // CREATE overrides / defaults (strongly recommended for tenant-specific enums):
- *  - ADPILER_FORCE_NETWORK=facebook         (exact enum for your tenant)
- *  - ADPILER_FORCE_TYPE=single_image        (exact enum for your tenant)
- *  - ADPILER_DEFAULT_NETWORK=facebook       (used if not forced and not inferred)
- *  - ADPILER_DEFAULT_TYPE=single_image      (used if not forced and not inferred)
- *  - ADPILER_PAGE_NAME=Zia Clovis (optional; falls back to client/list name if unset)
- *  - ADPILER_USE_LOGO_FROM_CARD=1           (optional; attach first asset as "logo" on create)
- *
- *  // CREATE extra (optional JSON merged into create form as strings)
- *  - ADPILER_CREATE_EXTRA_JSON={"status":"draft"}
+ *  - DEFAULT_CLIENT_ID (optional fallback)
+ *  - DEFAULT_PROJECT_ID (optional fallback → campaignId)
  */
 
 const fetch = require('node-fetch');
@@ -53,7 +41,12 @@ const FormData = require('form-data');
 const csv = require('csvtojson');
 const { URL } = require('url');
 
-// ---------- ENV ----------
+// ---------- FIXED VALUES (no new env) ----------
+const FIXED_NETWORK = 'facebook';
+const FIXED_TYPE = 'post';
+const DEFAULT_PAGE_NAME = 'Adpiler';
+
+// ---------- ENV (existing) ----------
 const {
   ADPILER_API_KEY,
   CLIENT_CSV_URL,
@@ -61,14 +54,7 @@ const {
   TRELLO_TOKEN,
   DEFAULT_CLIENT_ID = '',
   DEFAULT_PROJECT_ID = '',
-
-  ADPILER_FORCE_NETWORK = '',
-  ADPILER_FORCE_TYPE = '',
-  ADPILER_DEFAULT_NETWORK = '',
-  ADPILER_DEFAULT_TYPE = '',
-  ADPILER_PAGE_NAME = '',
-  ADPILER_USE_LOGO_FROM_CARD = '',
-  ADPILER_CREATE_EXTRA_JSON = '',
+  // We still accept ADPILER_API_BASE or ADPILER_BASE_URL from your current env
 } = process.env;
 
 // Accept either ADPILER_API_BASE or ADPILER_BASE_URL
@@ -88,7 +74,7 @@ const API = (p) => `${_API_BASE.replace(/\/+$/,'')}/${p.replace(/^\/+/, '')}`;
 const n = (s) => (s || '').toLowerCase().trim();
 
 // ---------- CSV MAPPING ----------
-async function getClientMapping(cardName /*, listName? */) {
+async function getClientMapping(cardName) {
   const fallback = {
     clientId: String(DEFAULT_CLIENT_ID || '').trim(),
     campaignId: String(DEFAULT_PROJECT_ID || '').trim(),
@@ -165,42 +151,10 @@ function extractAdMetaFromCard(card) {
   };
 }
 
-// ---------- INFERENCE & OVERRIDES ----------
-function inferNetwork({ card }) {
-  const forced = (ADPILER_FORCE_NETWORK || '').trim();
-  if (forced) return forced;
-
-  const text = `${card.name} ${card.desc} ${(card.labels || []).map(l => l.name).join(' ')}`.toLowerCase();
-  const map = [
-    { k: ['facebook','fb','meta '], v: 'facebook' },
-    { k: ['instagram','ig'], v: 'instagram' },
-    { k: ['tiktok'], v: 'tiktok' },
-    { k: ['linkedin','li '], v: 'linkedin' },
-    { k: ['pinterest','pin '], v: 'pinterest' },
-    { k: ['snapchat','snap '], v: 'snapchat' },
-    { k: ['twitter',' x '], v: 'twitter' },
-  ];
-  for (const m of map) if (m.k.some(k => text.includes(k))) return m.v;
-  return (ADPILER_DEFAULT_NETWORK || 'facebook');
-}
-
-function inferType({ card }) {
-  const forced = (ADPILER_FORCE_TYPE || '').trim();
-  if (forced) return forced;
-
-  const text = `${card.name} ${card.desc}`.toLowerCase();
-  if (text.includes('carousel')) return 'carousel';
-  if (text.includes('video'))    return 'video';
-  if (text.includes('gif'))      return 'gif';
-  if (text.includes('static') || text.includes('image')) return 'single_image';
-  return (ADPILER_DEFAULT_TYPE || 'single_image');
-}
-
-function derivePageName(cardName, mapping) {
-  // Priority: env override → CSV "Trello Client Name" contained in card title → fallback to card prefix before ":".
-  if (ADPILER_PAGE_NAME && ADPILER_PAGE_NAME.trim()) return ADPILER_PAGE_NAME.trim();
+function derivePageName(cardName) {
+  // Use prefix before ":" if present; else fallback to default
   const m = cardName.split(':')[0].trim();
-  return m || 'Page';
+  return m || DEFAULT_PAGE_NAME;
 }
 
 // ---------- HTTP HELPERS (with retries) ----------
@@ -280,33 +234,24 @@ async function postForm(path, form, maxAttempts = 4) {
 }
 
 // ---------- ADPILER API STEPS ----------
-function parseCreateExtras() {
-  if (!ADPILER_CREATE_EXTRA_JSON) return {};
-  try {
-    const obj = JSON.parse(ADPILER_CREATE_EXTRA_JSON);
-    return (obj && typeof obj === 'object') ? obj : {};
-  } catch (e) {
-    console.warn('ADPILER_CREATE_EXTRA_JSON is not valid JSON; ignoring');
-    return {};
-  }
-}
-
-async function createSocialAd({ campaignId, card, mapping, meta, attachments }) {
-  // Build multipart form per docs
+async function createSocialAd({ campaignId, card /*, attachments */ }) {
+  // Per your tenant schema: name + fixed network/type + page_name (multipart)
   const form = new FormData();
 
   const name = card.name;
-  const network = inferNetwork({ card });
-  const type = inferType({ card });
-  const pageName = derivePageName(card.name, mapping);
+  const network = FIXED_NETWORK;
+  const type = FIXED_TYPE;
+  const pageName = derivePageName(card.name);
 
   form.append('name', name);
   form.append('network', network);
   form.append('type', type);
   form.append('page_name', pageName);
 
-  // Optional: attach "logo" if env says so — we’ll use the first attachment
-  if (ADPILER_USE_LOGO_FROM_CARD === '1' && attachments && attachments.length) {
+  // NOTE: We are NOT attaching "logo" by default.
+  // If you want to attach a logo, uncomment below to send the first attachment as "logo".
+  /*
+  if (attachments && attachments.length) {
     try {
       const first = attachments[0];
       const buf = await downloadAttachmentBuffer(first.id);
@@ -316,26 +261,18 @@ async function createSocialAd({ campaignId, card, mapping, meta, attachments }) 
       console.warn('Could not attach logo from card:', e.message);
     }
   }
-
-  // Optional: merge any extra fields from env JSON as strings
-  const extras = parseCreateExtras();
-  for (const [k, v] of Object.entries(extras)) {
-    if (v === undefined || v === null) continue;
-    form.append(k, typeof v === 'string' ? v : JSON.stringify(v));
-  }
+  */
 
   console.log(`Creating social ad → campaign=${campaignId}, name="${name}", network=${network}, type=${type}, page_name="${pageName}"`);
   const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
 
   const adId = json.id || json.adId || json.data?.id;
-  if (!adId) {
-    throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
-  }
+  if (!adId) throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
   return { adId, raw: json };
 }
 
 async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
-  // POST /social-ads/{ad}/slides (multipart)
+  // POST /social-ads/{ad}/slides (multipart per file)
   const form = new FormData();
 
   if (meta.cta)            form.append('call_to_action',   meta.cta);
@@ -386,7 +323,7 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   const meta = extractAdMetaFromCard(card);
 
   // 1) Create Social Ad (multipart)
-  const { adId } = await createSocialAd({ campaignId, card, mapping, meta, attachments });
+  const { adId } = await createSocialAd({ campaignId, card /*, attachments*/ });
 
   // 2) Upload all attachments as slides (multipart per file)
   const { previewUrls } = await uploadSlides({ adId, attachments, meta });
@@ -403,3 +340,4 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
 }
 
 module.exports = { uploadToAdpiler };
+
