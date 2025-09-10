@@ -1,5 +1,5 @@
 /**
- * Trello → AdPiler (API path, resilient)
+ * Trello → AdPiler (API path, resilient + card-scoped Trello attachments)
  *
  * CREATE (multipart):
  *   POST /campaigns/{campaign}/social-ads
@@ -54,7 +54,6 @@ const {
   TRELLO_TOKEN,
   DEFAULT_CLIENT_ID = '',
   DEFAULT_PROJECT_ID = '',
-  // ADPILER_API_BASE or ADPILER_BASE_URL provided in your env
 } = process.env;
 
 // Accept either ADPILER_API_BASE or ADPILER_BASE_URL
@@ -115,39 +114,39 @@ async function getClientMapping(cardName) {
   throw new Error(`No client mapping found for card "${cardName}"`);
 }
 
-// ---------- TRELLO HELPERS ----------
-async function downloadAttachmentBuffer(attachmentId) {
+// ---------- TRELLO HELPERS (CARD-SCOPED) ----------
+async function fetchCardAttachmentMeta(cardId, attachmentId) {
+  const authQ = `key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
+  const url = `https://api.trello.com/1/cards/${cardId}/attachments/${attachmentId}?${authQ}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Attachment ${attachmentId} metadata fetch failed (${r.status})`);
+  return r.json();
+}
+
+async function downloadAttachmentBuffer(cardId, attachment) {
+  // If caller handed us full meta (with isUpload/url/name), use it; otherwise fetch it.
+  const meta = (attachment && typeof attachment.isUpload !== 'undefined')
+    ? attachment
+    : await fetchCardAttachmentMeta(cardId, attachment.id);
+
+  const isUpload = !!meta.isUpload;
+  const name = meta.name || `asset-${attachment.id}`;
   const authQ = `key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
 
-  // 1) Inspect attachment metadata
-  const metaRes = await fetch(`https://api.trello.com/1/attachments/${attachmentId}?${authQ}`);
-  if (!metaRes.ok) {
-    throw new Error(`Attachment ${attachmentId} metadata fetch failed (${metaRes.status})`);
-  }
-  const meta = await metaRes.json();
-  const isUpload = !!meta.isUpload;
-  const name = meta.name || `asset-${attachmentId}`;
-
-  // 2) Uploaded file → Trello /download
   if (isUpload) {
-    const dl = await fetch(`https://api.trello.com/1/attachments/${attachmentId}/download?${authQ}`);
-    if (!dl.ok) {
-      throw new Error(`Attachment ${attachmentId} Trello download failed (${dl.status})`);
-    }
+    // Card-scoped download endpoint
+    const dlUrl = `https://api.trello.com/1/cards/${cardId}/attachments/${attachment.id}/download?${authQ}`;
+    const dl = await fetch(dlUrl);
+    if (!dl.ok) throw new Error(`Attachment ${attachment.id} Trello download failed (${dl.status})`);
     const ab = await dl.arrayBuffer();
     return { buffer: Buffer.from(ab), filename: name };
   }
 
-  // 3) External link → fetch meta.url (must be public)
+  // External link (must be public)
   const externalUrl = meta.url;
-  if (!externalUrl) {
-    throw new Error(`Attachment ${attachmentId} is not an uploaded file and has no url`);
-  }
-
+  if (!externalUrl) throw new Error(`Attachment ${attachment.id} is not an uploaded file and has no url`);
   const extRes = await fetch(externalUrl, { redirect: 'follow' });
-  if (!extRes.ok) {
-    throw new Error(`Attachment ${attachmentId} external fetch failed (${extRes.status}) for ${externalUrl}`);
-  }
+  if (!extRes.ok) throw new Error(`Attachment ${attachment.id} external fetch failed (${extRes.status}) for ${externalUrl}`);
   const ab = await extRes.arrayBuffer();
   return { buffer: Buffer.from(ab), filename: name };
 }
@@ -179,14 +178,13 @@ function extractAdMetaFromCard(card) {
 }
 
 function derivePageName(cardName) {
-  // Use prefix before ":" if present; else fallback
   const m = cardName.split(':')[0].trim();
   return m || DEFAULT_PAGE_NAME;
 }
 
 // ---------- HTTP HELPERS (with retries) ----------
 async function postJSON(path, body, maxAttempts = 4) {
-  let attempt = 0; let lastErr;
+  let attempt = 0, lastErr;
   while (attempt < maxAttempts) {
     attempt++;
     try {
@@ -201,11 +199,9 @@ async function postJSON(path, body, maxAttempts = 4) {
       });
       const text = await resp.text();
       let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
-
       if (resp.ok) return json;
-
       if (resp.status >= 500) {
-        const delay = 400 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 200);
+        const delay = 400 * 2 ** (attempt - 1) + Math.floor(Math.random() * 200);
         console.warn(`AdPiler ${resp.status} on ${path} (attempt ${attempt}/${maxAttempts}) → retrying in ${delay}ms`);
         await new Promise(r => setTimeout(r, delay));
         continue;
@@ -214,7 +210,7 @@ async function postJSON(path, body, maxAttempts = 4) {
     } catch (e) {
       lastErr = e;
       if (attempt < maxAttempts) {
-        const delay = 400 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 200);
+        const delay = 400 * 2 ** (attempt - 1) + Math.floor(Math.random() * 200);
         console.warn(`POST ${path} failed (attempt ${attempt}/${maxAttempts}): ${e.message}. Retrying in ${delay}ms...`);
         await new Promise(r => setTimeout(r, delay));
       }
@@ -224,7 +220,7 @@ async function postJSON(path, body, maxAttempts = 4) {
 }
 
 async function postForm(path, form, maxAttempts = 4) {
-  let attempt = 0; let lastErr;
+  let attempt = 0, lastErr;
   while (attempt < maxAttempts) {
     attempt++;
     try {
@@ -238,11 +234,9 @@ async function postForm(path, form, maxAttempts = 4) {
       });
       const text = await resp.text();
       let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
-
       if (resp.ok) return json;
-
       if (resp.status >= 500) {
-        const delay = 400 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 200);
+        const delay = 400 * 2 ** (attempt - 1) + Math.floor(Math.random() * 200);
         console.warn(`AdPiler ${resp.status} on ${path} (attempt ${attempt}/${maxAttempts}) → retrying in ${delay}ms`);
         await new Promise(r => setTimeout(r, delay));
         continue;
@@ -251,7 +245,7 @@ async function postForm(path, form, maxAttempts = 4) {
     } catch (e) {
       lastErr = e;
       if (attempt < maxAttempts) {
-        const delay = 400 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 200);
+        const delay = 400 * 2 ** (attempt - 1) + Math.floor(Math.random() * 200);
         console.warn(`POST form ${path} failed (attempt ${attempt}/${maxAttempts}): ${e.message}. Retrying in ${delay}ms...`);
         await new Promise(r => setTimeout(r, delay));
       }
@@ -262,9 +256,7 @@ async function postForm(path, form, maxAttempts = 4) {
 
 // ---------- ADPILER API STEPS ----------
 async function createSocialAd({ campaignId, card /*, attachments*/ }) {
-  // Per your tenant schema: name + fixed network/type + page_name (multipart)
   const form = new FormData();
-
   const name = card.name;
   const network = FIXED_NETWORK;
   const type = FIXED_TYPE;
@@ -275,13 +267,13 @@ async function createSocialAd({ campaignId, card /*, attachments*/ }) {
   form.append('type', type);
   form.append('page_name', pageName);
 
-  // Optional: attach logo from first attachment (disabled by default)
+  // Optional: attach logo from first attachment — disabled by default.
+  // If you want this, pass cardId & use downloadAttachmentBuffer(card.id, attachments[0])
   /*
   if (attachments && attachments.length) {
     try {
-      const first = attachments[0];
-      const { buffer, filename } = await downloadAttachmentBuffer(first.id);
-      form.append('logo', buffer, { filename: filename || `logo-${first.id}` });
+      const { buffer, filename } = await downloadAttachmentBuffer(card.id, attachments[0]);
+      form.append('logo', buffer, { filename: filename || `logo-${attachments[0].id}` });
     } catch (e) {
       console.warn('Could not attach logo from card:', e.message);
     }
@@ -292,14 +284,11 @@ async function createSocialAd({ campaignId, card /*, attachments*/ }) {
   const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
 
   const adId = json.id || json.adId || json.data?.id;
-  if (!adId) {
-    throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
-  }
+  if (!adId) throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
   return { adId, raw: json };
 }
 
 async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
-  // POST /social-ads/{ad}/slides (multipart per file)
   const form = new FormData();
 
   if (meta.cta)            form.append('call_to_action',   meta.cta);
@@ -327,7 +316,7 @@ async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
   return previewUrls;
 }
 
-async function uploadSlides({ adId, attachments, meta }) {
+async function uploadSlides({ cardId, adId, attachments, meta }) {
   const allPreviewUrls = [];
   let successCount = 0;
   let triedCount = 0;
@@ -336,7 +325,7 @@ async function uploadSlides({ adId, attachments, meta }) {
     if (!att || !att.id) continue;
     triedCount++;
     try {
-      const { buffer, filename } = await downloadAttachmentBuffer(att.id);
+      const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
       const urls = await uploadOneSlide({
         adId,
         fileBuf: buffer,
@@ -370,8 +359,8 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   // 1) Create Social Ad (multipart)
   const { adId } = await createSocialAd({ campaignId, card /*, attachments*/ });
 
-  // 2) Upload all attachments as slides (multipart per file)
-  const { previewUrls } = await uploadSlides({ adId, attachments, meta });
+  // 2) Upload all attachments as slides (multipart per file) — now card-scoped
+  const { previewUrls } = await uploadSlides({ cardId: card.id, adId, attachments, meta });
 
   // 3) Optional: comment back on Trello
   if (postTrelloComment) {
@@ -385,5 +374,4 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
 }
 
 module.exports = { uploadToAdpiler };
-
 
