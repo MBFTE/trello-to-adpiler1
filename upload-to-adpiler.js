@@ -1,6 +1,9 @@
 /**
  * Trello → AdPiler uploader (API path, resilient)
- * Creates a Social Ad, then uploads each attachment as a slide.
+ * - Creates a Social Ad (multipart: name, network, type, page_name)
+ * - Then uploads each attachment as a slide (multipart: media_file + metadata)
+ * - Card-scoped Trello attachment fetch (handles uploads and public links)
+ * - Auto tries "carousel" for multi-attachment cards; falls back to "post" w/ 1 slide
  */
 
 const fetch = require('node-fetch');
@@ -9,8 +12,8 @@ const csv = require('csvtojson');
 const { URL } = require('url');
 
 // ---------- FIXED VALUES ----------
-const FIXED_NETWORK = 'facebook';
-const FIXED_TYPE = 'post';
+const FIXED_NETWORK = 'facebook';        // tenant requires this
+const FIXED_POST_TYPE = 'post';          // tenant schema example
 const DEFAULT_PAGE_NAME = 'Adpiler';
 
 // ---------- ENV ----------
@@ -36,11 +39,9 @@ function assertEnv() {
 }
 
 const API = (p) => `${_API_BASE.replace(/\/+$/,'')}/${p.replace(/^\/+/, '')}`;
-const n = (s) => (s || '').toLowerCase().trim();
+const normalize = (s) => (s || '').toLowerCase().trim();
 
 // ---------- CSV MAPPING ----------
-function normalize(str) { return (str || '').toLowerCase().trim(); }
-
 async function getClientMapping(cardName) {
   const fallback = {
     clientId: String(DEFAULT_CLIENT_ID || '').trim(),
@@ -59,19 +60,16 @@ async function getClientMapping(cardName) {
   if (!res.ok) throw new Error(`Mapping CSV fetch failed (${res.status})`);
   const rows = await csv().fromString(await res.text());
 
-  // Try exact client name inside card title
-  const normalizedCardName = normalize(cardName);
-  let row = rows.find(r => normalizedCardName.includes(normalize(r['Trello Client Name'])));
-
-  // If not found, try exact equality
-  if (!row) row = rows.find(r => normalize(r['Trello Client Name']) === normalizedCardName);
+  const lcCard = normalize(cardName);
+  let row = rows.find(r => lcCard.includes(normalize(r['Trello Client Name'])));
+  if (!row) row = rows.find(r => normalize(r['Trello Client Name']) === lcCard);
 
   if (row) {
     const clientId   = String(row['Adpiler Client ID'] || '').trim();
     const folderId   = String(row['Adpiler Folder ID'] || '').trim();
     const campaignId = String(row['Adpiler Campaign ID'] || '').trim();
     if (clientId && campaignId) return { clientId, projectId: campaignId, folderId, campaignId };
-    console.warn(`CSV row for "${cardName}" is missing required fields. Falling back.`);
+    console.warn(`CSV match for "${cardName}" missing required fields; falling back.`);
   } else {
     console.warn(`No CSV match for "${cardName}".`);
   }
@@ -83,7 +81,7 @@ async function getClientMapping(cardName) {
   throw new Error(`No valid client mapping found for card "${cardName}"`);
 }
 
-// ---------- TRELLO HELPERS (card-scoped) ----------
+// ---------- TRELLO ATTACHMENTS (card-scoped) ----------
 async function fetchCardAttachmentMeta(cardId, attachmentId) {
   const authQ = `key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
   const url = `https://api.trello.com/1/cards/${cardId}/attachments/${attachmentId}?${authQ}`;
@@ -102,7 +100,6 @@ async function downloadAttachmentBuffer(cardId, attachment) {
   const authQ = `key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
 
   if (isUpload) {
-    // Card-scoped download endpoint
     const dlUrl = `https://api.trello.com/1/cards/${cardId}/attachments/${attachment.id}/download?${authQ}`;
     const dl = await fetch(dlUrl);
     if (!dl.ok) throw new Error(`Attachment ${attachment.id} Trello download failed (${dl.status})`);
@@ -110,7 +107,6 @@ async function downloadAttachmentBuffer(cardId, attachment) {
     return { buffer: Buffer.from(ab), filename: name };
   }
 
-  // External link (must be public)
   const externalUrl = meta.url;
   if (!externalUrl) throw new Error(`Attachment ${attachment.id} is not an uploaded file and has no url`);
   const extRes = await fetch(externalUrl, { redirect: 'follow' });
@@ -142,7 +138,7 @@ function derivePageName(cardName) {
   return m || DEFAULT_PAGE_NAME;
 }
 
-// ---------- HTTP HELPERS ----------
+// ---------- HTTP (with retries) ----------
 async function postForm(path, form, maxAttempts = 4) {
   let attempt = 0, lastErr;
   while (attempt < maxAttempts) {
@@ -176,7 +172,7 @@ async function postForm(path, form, maxAttempts = 4) {
   throw lastErr || new Error(`POST form ${path} failed after retries`);
 }
 
-// ---------- ADPILER API ----------
+// ---------- AdPiler: Create & Slides ----------
 async function createSocialAd({ campaignId, card, attachments }) {
   const tryCreate = async (typeVal) => {
     const form = new FormData();
@@ -192,29 +188,78 @@ async function createSocialAd({ campaignId, card, attachments }) {
     return { adId, raw: json, typeUsed: typeVal };
   };
 
-  // If multiple attachments or title says "carousel", prefer carousel
   const wantCarousel = (attachments && attachments.length > 1) || /carousel/i.test(card.name);
-
   if (wantCarousel) {
     try {
       return await tryCreate('carousel');
     } catch (e) {
-      const msg = String(e && e.message || '').toLowerCase();
-      // If tenant rejects the enum, fall back to post
-      if (msg.includes('selected type is invalid') || msg.includes('"type"') && msg.includes('invalid')) {
+      const msg = String(e?.message || '').toLowerCase();
+      if (msg.includes('selected type is invalid') || (msg.includes('"type"') && msg.includes('invalid'))) {
         console.warn('Type "carousel" rejected by tenant; falling back to "post" (will limit to 1 slide).');
       } else {
-        throw e; // other errors should bubble up
+        throw e;
       }
     }
   }
-
-  // Default: post
-  return await tryCreate(FIXED_TYPE); // 'post'
+  return await tryCreate(FIXED_POST_TYPE);
 }
 
+async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
+  const form = new FormData();
+  if (meta.cta)            form.append('call_to_action',   meta.cta);
+  if (meta.displayLink)    form.append('display_link',     meta.displayLink);
+  if (meta.headline)       form.append('headline',         meta.headline);
+  if (meta.description)    form.append('description',      meta.description);
+  if (meta.url)            form.append('landing_page_url', meta.url);
+  form.append('media_file', fileBuf, { filename });
 
-// ---------- MAIN ENTRY ----------
+  const json = await postForm(`social-ads/${encodeURIComponent(adId)}/slides`, form);
+
+  const previewUrls = [];
+  const push = (v) => { if (v && typeof v === 'string') previewUrls.push(v); };
+
+  if (json.preview_url) push(json.preview_url);
+  if (Array.isArray(json.preview_urls)) json.preview_urls.forEach(push);
+  if (Array.isArray(json.links)) json.links.forEach(push);
+  if (json.data && Array.isArray(json.data)) {
+    json.data.forEach(item => {
+      push(item.preview_url);
+      if (item.links) (Array.isArray(item.links) ? item.links : [item.links]).forEach(push);
+    });
+  }
+  return previewUrls;
+}
+
+async function uploadSlides({ cardId, adId, attachments, meta }) {
+  const allPreviewUrls = [];
+  let successCount = 0;
+  let triedCount = 0;
+
+  const sorted = (attachments || []).slice().sort((a, b) =>
+    (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' })
+  );
+
+  for (const att of sorted) {
+    if (!att || !att.id) continue;
+    triedCount++;
+    try {
+      const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
+      const urls = await uploadOneSlide({ adId, fileBuf: buffer, filename: filename || `asset-${att.id}`, meta });
+      allPreviewUrls.push(...(urls || []));
+      successCount++;
+    } catch (e) {
+      console.warn(`⚠️ Skipping attachment ${att.id} (${att.name || ''}): ${e.message}`);
+    }
+  }
+
+  if (triedCount > 0 && successCount === 0) {
+    throw new Error('None of the card attachments could be fetched. Ensure at least one attachment is an uploaded file in Trello or a publicly accessible link.');
+  }
+
+  return { previewUrls: allPreviewUrls };
+}
+
+// ---------- Main entry ----------
 async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   assertEnv();
 
@@ -230,16 +275,15 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
 
   const meta = extractAdMetaFromCard(card);
 
-  // 1) Create Social Ad (may be carousel or post, depending on tenant)
+  // 1) Create Social Ad (tries carousel when multiple attachments; else post)
   const { adId, typeUsed } = await createSocialAd({ campaignId, card, attachments });
 
-  // 2) Decide which attachments to upload
+  // 2) Enforce AdPiler constraint for post/story = 1 slide
   let attsToUpload = attachments || [];
   let note = '';
   if (typeUsed === 'post' && attsToUpload.length > 1) {
-    // AdPiler limit: post/story = 1 slide → only upload the first
     attsToUpload = [attsToUpload[0]];
-    note = `Note: This was created as a "post", which supports only 1 slide. Uploaded the first attachment only.`;
+    note = `Note: "post" supports only 1 slide; uploaded the first attachment only.`;
   }
 
   // 3) Upload slides
@@ -249,9 +293,7 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   if (postTrelloComment) {
     const lines = [];
     lines.push(`Created AdPiler Social Ad (id: ${adId}, type: ${typeUsed}) and uploaded ${attsToUpload.length} attachment(s).`);
-    if (previewUrls?.length) {
-      lines.push(previewUrls.join('\n'));
-    }
+    if (previewUrls?.length) lines.push(previewUrls.join('\n'));
     if (note) lines.push(note);
     try { await postTrelloComment(card.id, lines.join('\n')); } catch {}
   }
@@ -259,4 +301,6 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   return { adId, previewUrls };
 }
 
-
+// Export both named and default to be safe with require()
+module.exports = { uploadToAdpiler };
+module.exports.default = uploadToAdpiler;
