@@ -187,13 +187,19 @@ async function createSocialAd({ campaignId, card, type = 'post', isCarousel = fa
   form.append('type', type); // always 'post' for FB unless docs say otherwise
   form.append('page_name', derivePageName(card.name));
 
-  // If we know the extra field Adpiler expects for carousel, set it here:
-  const isCarousel = card.name.toLowerCase().includes('carousel');
-const { adId } = await createSocialAd({
-  campaignId,
-  card,
-  type: 'post', // keep as 'post' unless docs confirm another valid type
-});
+  // If Adpiler requires a carousel flag, add it here once confirmed:
+  if (isCarousel) {
+    // form.append('ad_format', 'carousel');
+    // or:
+    // form.append('is_carousel', '1');
+  }
+
+  console.log(`Creating social ad → campaign=${campaignId}, type=${type}, carousel=${isCarousel}`);
+  const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
+
+  const adId = json.id || json.adId || json.data?.id;
+  if (!adId) throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
+  return { adId, raw: json };
 
 
   console.log(`Creating social ad → campaign=${campaignId}, type=${type}, carousel=${isCarousel}`);
