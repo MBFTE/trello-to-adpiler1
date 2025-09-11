@@ -51,6 +51,10 @@ try {
 
 app.use(bodyParser.json({ limit: '5mb' }));
 
+console.log('🧪 ADPILER_UPLOAD_MODE =', UPLOAD_MODE);
+console.log('🧪 typeof uploadApi?.uploadToAdpiler =', typeof uploadApi?.uploadToAdpiler);
+
+
 // Health check
 app.get('/', (_req, res) => res.status(200).send(`✅ Trello → AdPiler is running (mode: ${UPLOAD_MODE})`));
 app.head('/trello-webhook', (_req, res) => res.sendStatus(200));
