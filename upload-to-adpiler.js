@@ -193,7 +193,6 @@ const { adId } = await createSocialAd({
   campaignId,
   card,
   type: 'post', // keep as 'post' unless docs confirm another valid type
-  isCarousel
 });
 
 
