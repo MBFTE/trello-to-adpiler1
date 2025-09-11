@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const bodyParser = require('body-parser');
 const dotenv = require('dotenv');
@@ -8,10 +9,10 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// --- Simple in-process queue & cooldown ---
+// --- Simple in-process queue ---
 const jobQueue = [];
 let processing = false;
-async function enqueueJob(fn) {
+function enqueueJob(fn) {
   return new Promise((resolve, reject) => {
     jobQueue.push({ fn, resolve, reject });
     processQueue();
@@ -26,41 +27,55 @@ async function processQueue() {
   }
   processing = false;
 }
+
+// --- Cooldown to prevent double-handling ---
 const lastRun = new Map();
 const COOLDOWN_MS = 2 * 60 * 1000;
 
-// Normalize helper
+// --- Helpers / config ---
 const normalize = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 const READY_LIST_NAME = normalize(process.env.READY_LIST_NAME || 'Ready For AdPiler');
-const UPLOAD_MODE = (process.env.ADPILER_UPLOAD_MODE || 'api').toLowerCase();
+const UPLOAD_MODE = (process.env.ADPILER_UPLOAD_MODE || 'api').toString().trim().toLowerCase();
 
-// Lazy imports
-let uploadApi, uploadUI;
+app.use(bodyParser.json({ limit: '5mb' }));
+
+// ---------- Uploader resolver (tolerates default/named exports) ----------
+function resolveUploader(mod) {
+  if (!mod) return null;
+  if (typeof mod === 'function') return mod;                       // default = function
+  if (typeof mod.uploadToAdpiler === 'function') return mod.uploadToAdpiler; // named
+  if (typeof mod.default === 'function') return mod.default;       // ES default
+  return null;
+}
+
+let uploadApiMod = null;
+let uploadUIMod = null;
 try {
-  uploadApi = require('./upload-to-adpiler');
+  uploadApiMod = require('./upload-to-adpiler');
   console.log('✅ Loaded upload-to-adpiler.js');
 } catch (e) {
   console.error('❌ Failed to load upload-to-adpiler.js:', e.message);
 }
 try {
-  uploadUI = require('./upload-to-adpiler-ui');
+  uploadUIMod = require('./upload-to-adpiler-ui');
   console.log('✅ Loaded upload-to-adpiler-ui.js');
 } catch (e) {
   console.error('❌ Failed to load upload-to-adpiler-ui.js:', e.message);
 }
 
-app.use(bodyParser.json({ limit: '5mb' }));
+const uploadApi = resolveUploader(uploadApiMod);
+const uploadUI  = resolveUploader(uploadUIMod);
 
 console.log('🧪 ADPILER_UPLOAD_MODE =', UPLOAD_MODE);
-console.log('🧪 typeof uploadApi?.uploadToAdpiler =', typeof uploadApi?.uploadToAdpiler);
+console.log('🧪 uploader api type =', typeof uploadApi);
+console.log('🧪 uploader ui  type =', typeof uploadUI);
 
-
-// Health check
+// ---------- Health checks ----------
 app.get('/', (_req, res) => res.status(200).send(`✅ Trello → AdPiler is running (mode: ${UPLOAD_MODE})`));
 app.head('/trello-webhook', (_req, res) => res.sendStatus(200));
 app.get('/trello-webhook', (_req, res) => res.status(200).send('OK'));
 
-// Trello helpers
+// ---------- Trello helpers ----------
 async function getFullCard(cardId) {
   const auth = `key=${process.env.TRELLO_API_KEY}&token=${process.env.TRELLO_TOKEN}`;
   const base = `https://api.trello.com/1/cards/${cardId}`;
@@ -84,9 +99,9 @@ async function postTrelloComment(cardId, text) {
   await fetch(url, { method: 'POST' }).catch(e => console.error('Comment post failed:', e.message));
 }
 
-// Webhook handler
+// ---------- Webhook ----------
 app.post('/trello-webhook', async (req, res) => {
-  res.sendStatus(200); // ack fast so Trello keeps webhook alive
+  res.sendStatus(200); // acknowledge immediately
   try {
     const type = req.body?.action?.type;
     const listAfter = req.body?.action?.data?.listAfter?.name || '';
@@ -105,6 +120,7 @@ app.post('/trello-webhook', async (req, res) => {
     const card = await getFullCard(cardId);
     console.log(`🗂️  Card "${card.name}" with ${card.attachments?.length || 0} attachment(s).`);
 
+    // cooldown per card
     const prev = lastRun.get(cardId) || 0;
     const now = Date.now();
     if (now - prev < COOLDOWN_MS) {
@@ -116,14 +132,16 @@ app.post('/trello-webhook', async (req, res) => {
     await enqueueJob(async () => {
       let result = null;
 
-      if (UPLOAD_MODE === 'api' && uploadApi?.uploadToAdpiler) {
+      if (UPLOAD_MODE === 'api' && uploadApi) {
         console.log('🚀 Using API uploader...');
-        result = await uploadApi.uploadToAdpiler(card, card.attachments, { postTrelloComment });
-      } else if (UPLOAD_MODE === 'ui' && uploadUI?.uploadToAdpilerUI) {
+        result = await uploadApi(card, card.attachments, { postTrelloComment });
+      } else if (UPLOAD_MODE === 'ui' && uploadUI) {
         console.log('🧭 Using UI uploader...');
-        result = await uploadUI.uploadToAdpilerUI(card, card.attachments, { postTrelloComment });
+        result = await uploadUI(card, card.attachments, { postTrelloComment });
       } else {
-        throw new Error('No uploader available. Ensure ADPILER_UPLOAD_MODE=ui or api and the corresponding file exists.');
+        console.error('🔍 uploadApi keys:', Object.keys(uploadApiMod || {}));
+        console.error('🔍 uploadUIMod keys:', Object.keys(uploadUIMod || {}));
+        throw new Error('No uploader available. Ensure ADPILER_UPLOAD_MODE=ui or api and the corresponding export exists.');
       }
 
       const urls = result?.previewUrls || [];
@@ -141,8 +159,7 @@ app.post('/trello-webhook', async (req, res) => {
   }
 });
 
-// Start server
+// ---------- Start ----------
 app.listen(PORT, () => {
   console.log(`🌐 Server running on port ${PORT} (mode: ${UPLOAD_MODE})`);
 });
-
