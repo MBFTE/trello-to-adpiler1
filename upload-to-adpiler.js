@@ -38,46 +38,66 @@ const API = (p) => `${_API_BASE.replace(/\/+$/,'')}/${p.replace(/^\/+/, '')}`;
 const n = (s) => (s || '').toLowerCase().trim();
 
 // ---------- CSV MAPPING ----------
+const csv = require('csvtojson');
+const fetch = require('node-fetch');
+
+function normalize(str) {
+  return (str || '').toLowerCase().trim();
+}
+
 async function getClientMapping(cardName) {
   const fallback = {
-    clientId: String(DEFAULT_CLIENT_ID || '').trim(),
-    campaignId: String(DEFAULT_PROJECT_ID || '').trim(),
+    clientId: String(process.env.DEFAULT_CLIENT_ID || '').trim(),
+    campaignId: String(process.env.DEFAULT_PROJECT_ID || '').trim(),
     folderId: '',
   };
 
-  if (!CLIENT_CSV_URL) {
+  const csvUrl = process.env.CLIENT_CSV_URL;
+  if (!csvUrl) {
     if (fallback.clientId) {
-      return { clientId: fallback.clientId, projectId: fallback.campaignId, folderId: '', campaignId: fallback.campaignId };
+      return {
+        clientId: fallback.clientId,
+        projectId: fallback.campaignId,
+        folderId: '',
+        campaignId: fallback.campaignId
+      };
     }
     throw new Error('CLIENT_CSV_URL not set and no DEFAULT_CLIENT_ID provided');
   }
 
-  const res = await fetch(CLIENT_CSV_URL);
+  const res = await fetch(csvUrl);
   if (!res.ok) throw new Error(`Mapping CSV fetch failed (${res.status})`);
   const rows = await csv().fromString(await res.text());
 
-  const row = rows.find(r => n(cardName).includes(n(r['Trello Client Name'])));
+  const normalizedCardName = normalize(cardName);
+  const row = rows.find(r => normalize(r['Trello Client Name']) === normalizedCardName);
 
   if (row) {
     const clientId   = String(row['Adpiler Client ID'] || '').trim();
     const folderId   = String(row['Adpiler Folder ID'] || '').trim();
     const campaignId = String(row['Adpiler Campaign ID'] || '').trim();
-    if (clientId) return { clientId, projectId: campaignId, folderId, campaignId };
 
-    if (fallback.clientId) {
-      console.warn(`CSV row for "${cardName}" missing Adpiler Client ID; using DEFAULT_CLIENT_ID.`);
-      return { clientId: fallback.clientId, projectId: fallback.campaignId, folderId: '', campaignId: fallback.campaignId };
+    if (clientId && campaignId) {
+      return { clientId, projectId: campaignId, folderId, campaignId };
     }
-    throw new Error(`Mapping row missing Adpiler Client ID for "${row['Trello Client Name'] || cardName}"`);
+
+    console.warn(`CSV row for "${cardName}" is missing required fields. Falling back.`);
+  } else {
+    console.warn(`No CSV match for "${cardName}".`);
   }
 
-  if (fallback.clientId) {
-    console.warn(`No CSV match for "${cardName}". Falling back to DEFAULT_CLIENT_ID.`);
-    return { clientId: fallback.clientId, projectId: fallback.campaignId, folderId: '', campaignId: fallback.campaignId };
+  if (fallback.clientId && fallback.campaignId) {
+    return {
+      clientId: fallback.clientId,
+      projectId: fallback.campaignId,
+      folderId: '',
+      campaignId: fallback.campaignId
+    };
   }
 
-  throw new Error(`No client mapping found for card "${cardName}"`);
+  throw new Error(`No valid client mapping found for card "${cardName}"`);
 }
+
 
 // ---------- TRELLO HELPERS ----------
 async function fetchCardAttachmentMeta(cardId, attachmentId) {
