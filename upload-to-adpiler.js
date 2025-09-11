@@ -1,9 +1,10 @@
 /**
- * Trello → AdPiler uploader (API path, creates one POST per attachment)
- * - For EACH attachment on the Trello card:
- *   1) Create Social Ad (multipart: name, network=facebook, type=post, page_name)
- *   2) Upload exactly that file as one slide (multipart: media_file + metadata)
- * - Card-scoped Trello attachment fetch (handles uploads and public links)
+ * Trello → AdPiler uploader (ONE AD, multiple slides)
+ * - Creates exactly ONE Social Ad.
+ * - If there are multiple attachments (or title says "carousel"), try type=carousel.
+ * - If tenant rejects carousel, fall back to type=post and upload only the first slide
+ *   (per AdPiler: "Post and story can't have more than 1 slide.").
+ * - Card-scoped Trello attachment fetch; continues on per-file errors.
  */
 
 const fetch = require('node-fetch');
@@ -13,7 +14,7 @@ const { URL } = require('url');
 
 // ---------- FIXED VALUES ----------
 const FIXED_NETWORK = 'facebook';
-const FIXED_TYPE = 'post';
+const FIXED_POST_TYPE = 'post';
 const DEFAULT_PAGE_NAME = 'Adpiler';
 
 // ---------- ENV ----------
@@ -172,30 +173,53 @@ async function postForm(path, form, maxAttempts = 4) {
   throw lastErr || new Error(`POST form ${path} failed after retries`);
 }
 
-// ---------- AdPiler: Create & Slides ----------
-async function createSocialAd({ campaignId, card }) {
-  // Always create a POST ad (one slide) per attachment
-  const form = new FormData();
-  form.append('name', card.name);
-  form.append('network', FIXED_NETWORK);
-  form.append('type', FIXED_TYPE);
-  form.append('page_name', derivePageName(card.name));
+// ---------- AdPiler: Create ONE ad, then upload slides ----------
+async function createSocialAd({ campaignId, card, preferCarousel }) {
+  const tryCreate = async (typeVal) => {
+    const form = new FormData();
+    form.append('name', card.name);
+    form.append('network', FIXED_NETWORK);
+    form.append('type', typeVal);
+    form.append('page_name', derivePageName(card.name));
 
-  console.log(`Creating social ad → campaign=${campaignId}, name="${card.name}", network=${FIXED_NETWORK}, type=${FIXED_TYPE}, page_name="${derivePageName(card.name)}"`);
-  const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
+    console.log(`Creating social ad → campaign=${campaignId}, name="${card.name}", network=${FIXED_NETWORK}, type=${typeVal}, page_name="${derivePageName(card.name)}"`);
+    const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
+    const adId = json.id || json.adId || json.data?.id;
+    if (!adId) throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
+    return { adId, raw: json, typeUsed: typeVal };
+  };
 
-  const adId = json.id || json.adId || json.data?.id;
-  if (!adId) throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
-  return { adId, raw: json };
+  if (preferCarousel) {
+    try {
+      return await tryCreate('carousel');
+    } catch (e) {
+      const msg = String(e?.message || '').toLowerCase();
+      if (msg.includes('selected type is invalid') || (msg.includes('"type"') && msg.includes('invalid'))) {
+        console.warn('Type "carousel" rejected by tenant; falling back to "post" (will limit to 1 slide).');
+      } else {
+        throw e;
+      }
+    }
+  }
+  return await tryCreate(FIXED_POST_TYPE);
 }
 
 async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
   const form = new FormData();
-  if (meta.cta)            form.append('call_to_action',   meta.cta);
-  if (meta.displayLink)    form.append('display_link',     meta.displayLink);
-  if (meta.headline)       form.append('headline',         meta.headline);
-  if (meta.description)    form.append('description',      meta.description);
-  if (meta.url)            form.append('landing_page_url', meta.url);
+  if (meta.cta)         form.append('call_to_action',   meta.cta);
+  if (meta.displayLink) form.append('display_link',     meta.displayLink);
+  if (meta.headline)    form.append('headline',         meta.headline);
+  if (meta.description) form.append('description',      meta.description);
+
+  // Only send landing_page_url if absolute
+  try {
+    if (meta.url) {
+      const u = new URL(meta.url);
+      if (u.protocol === 'http:' || u.protocol === 'https:') {
+        form.append('landing_page_url', u.toString());
+      }
+    }
+  } catch {}
 
   form.append('media_file', fileBuf, { filename });
 
@@ -216,7 +240,37 @@ async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
   return previewUrls;
 }
 
-// ---------- Main entry (one POST per attachment) ----------
+async function uploadSlides({ cardId, adId, attachments, meta }) {
+  const allPreviewUrls = [];
+  let successCount = 0;
+  let triedCount = 0;
+
+  const sorted = (attachments || []).slice().sort((a, b) =>
+    (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' })
+  );
+
+  for (const att of sorted) {
+    if (!att || !att.id) continue;
+    tried++;
+    try {
+      const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
+      const urls = await uploadOneSlide({ adId, fileBuf: buffer, filename: filename || `asset-${att.id}`, meta });
+      allPreviewUrls.push(...(urls || []));
+      successCount++;
+      await new Promise(r => setTimeout(r, 200)); // gentle pacing
+    } catch (e) {
+      console.warn(`⚠️ Skipping attachment ${att.id} (${att.name || ''}): ${e.message}`);
+    }
+  }
+
+  if (triedCount > 0 && successCount === 0) {
+    throw new Error('None of the card attachments could be fetched. Ensure at least one attachment is an uploaded file in Trello or a publicly accessible link.');
+  }
+
+  return { previewUrls: allPreviewUrls };
+}
+
+// ---------- Main entry (ONE ad only) ----------
 async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   assertEnv();
 
@@ -232,61 +286,37 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
 
   const meta = extractAdMetaFromCard(card);
 
-  // Stable, human-friendly order
-  const sorted = (attachments || []).slice().sort((a, b) =>
-    (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' })
-  );
+  // Decide whether to try carousel
+  const preferCarousel = (attachments && attachments.length > 1) || /carousel/i.test(card.name);
 
-  const created = [];
-  const allPreviews = [];
-  let tried = 0, succeeded = 0;
+  // 1) Create exactly ONE Social Ad
+  const { adId, typeUsed } = await createSocialAd({ campaignId, card, preferCarousel });
 
-  for (const att of sorted) {
-    if (!att || !att.id) continue;
-    tried++;
-
-    try {
-      // Create a fresh POST ad for THIS attachment
-      const { adId } = await createSocialAd({ campaignId, card });
-
-      // Download the attachment (Trello upload or public link)
-      const { buffer, filename } = await downloadAttachmentBuffer(card.id, att);
-
-      // Upload it as the single slide
-      const urls = await uploadOneSlide({ adId, fileBuf: buffer, filename: filename || `asset-${att.id}`, meta });
-
-      created.push({ adId, filename: filename || att.name || `asset-${att.id}`, previewUrls: urls });
-      allPreviews.push(...(urls || []));
-      succeeded++;
-
-      // small delay to be nice to APIs
-      await new Promise(r => setTimeout(r, 250));
-
-    } catch (e) {
-      console.warn(`⚠️ Skipping attachment ${att.id} (${att.name || ''}): ${e.message}`);
-    }
+  // 2) If we ended up with 'post', AdPiler allows only 1 slide
+  let attsToUpload = attachments || [];
+  let note = '';
+  if (typeUsed === 'post' && attsToUpload.length > 1) {
+    attsToUpload = [attsToUpload[0]];
+    note = `Note: Tenant does not support "carousel". Created a "post" ad, which supports only 1 slide. Uploaded the first attachment only.`;
   }
 
-  if (tried > 0 && succeeded === 0) {
-    throw new Error('No attachments could be processed. Ensure at least one is an uploaded file in Trello or a publicly accessible link.');
-  }
+  // 3) Upload slides to THIS ONE ad
+  const { previewUrls } = await uploadSlides({ cardId: card.id, adId, attachments: attsToUpload, meta });
 
-  // Comment back to Trello (best-effort)
+  // 4) Comment back to Trello (best-effort)
   if (postTrelloComment) {
     const lines = [];
-    lines.push(`Created ${created.length} AdPiler post(s).`);
-    for (const c of created) {
-      const previewStr = (c.previewUrls && c.previewUrls.length) ? ` → ${c.previewUrls.join(', ')}` : '';
-      lines.push(`• Ad ${c.adId} (${c.filename})${previewStr}`);
-    }
+    lines.push(`Created AdPiler Social Ad (id: ${adId}, type: ${typeUsed}) and uploaded ${attsToUpload.length} attachment(s).`);
+    if (previewUrls?.length) lines.push(previewUrls.join('\n'));
+    if (note) lines.push(note);
     try { await postTrelloComment(card.id, lines.join('\n')); } catch {}
   }
 
-  // Return first adId for convenience and all preview links
-  return { adId: created[0]?.adId, previewUrls: allPreviews };
+  return { adId, previewUrls };
 }
 
 // Export both named and default to be safe with require()
 module.exports = { uploadToAdpiler };
 module.exports.default = uploadToAdpiler;
+
 
