@@ -165,6 +165,10 @@ try {
 } catch {
   parsed = { raw: text };
 }
+
+      catch {
+  parsed = { raw: text };
+}
       if (resp.ok) return json;
       if (resp.status >= 500) {
         const delay = 400 * 2 ** (attempt - 1) + Math.floor(Math.random() * 200);
