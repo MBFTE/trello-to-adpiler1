@@ -1,39 +1,6 @@
 /**
- * Trello → AdPiler (API path, resilient + card-scoped Trello attachments)
- *
- * CREATE (multipart):
- *   POST /campaigns/{campaign}/social-ads
- *   fields:
- *     - name (string)
- *     - network (string)   ← fixed "facebook"
- *     - type (string)      ← fixed "post"
- *     - page_name (string) ← derived from card, fallback "Adpiler"
- *     - logo (binary)      ← optional (disabled by default)
- *
- * SLIDES (multipart per file):
- *   POST /social-ads/{ad}/slides
- *   fields:
- *     - call_to_action
- *     - display_link
- *     - headline
- *     - description
- *     - landing_page_url
- *     - media_file (binary)
- *
- * CSV headers expected:
- *  - "Trello Client Name"
- *  - "Adpiler Client ID"
- *  - "Adpiler Folder ID"
- *  - "Adpiler Campaign ID"  ← used as {campaign}
- *
- * REQUIRED ENV (you already have these):
- *  - ADPILER_API_BASE=https://platform.adpiler.com/api   (or ADPILER_BASE_URL)
- *  - ADPILER_API_KEY=...     (Bearer)
- *  - CLIENT_CSV_URL=https://.../pub?output=csv  (or set DEFAULT_CLIENT_ID/DEFAULT_PROJECT_ID)
- *  - TRELLO_API_KEY=...
- *  - TRELLO_TOKEN=...
- *  - DEFAULT_CLIENT_ID (optional)
- *  - DEFAULT_PROJECT_ID (optional → campaignId)
+ * Trello → AdPiler uploader
+ * Supports single-image posts and multi-slide carousel ads.
  */
 
 const fetch = require('node-fetch');
@@ -41,12 +8,11 @@ const FormData = require('form-data');
 const csv = require('csvtojson');
 const { URL } = require('url');
 
-// ---------- FIXED VALUES (no new env) ----------
+// ---------- FIXED VALUES ----------
 const FIXED_NETWORK = 'facebook';
-const FIXED_TYPE = 'post';
 const DEFAULT_PAGE_NAME = 'Adpiler';
 
-// ---------- ENV (existing) ----------
+// ---------- ENV ----------
 const {
   ADPILER_API_KEY,
   CLIENT_CSV_URL,
@@ -56,7 +22,6 @@ const {
   DEFAULT_PROJECT_ID = '',
 } = process.env;
 
-// Accept either ADPILER_API_BASE or ADPILER_BASE_URL
 const _API_BASE = (process.env.ADPILER_API_BASE || process.env.ADPILER_BASE_URL || '').trim();
 
 function assertEnv() {
@@ -114,7 +79,7 @@ async function getClientMapping(cardName) {
   throw new Error(`No client mapping found for card "${cardName}"`);
 }
 
-// ---------- TRELLO HELPERS (CARD-SCOPED) ----------
+// ---------- TRELLO HELPERS ----------
 async function fetchCardAttachmentMeta(cardId, attachmentId) {
   const authQ = `key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
   const url = `https://api.trello.com/1/cards/${cardId}/attachments/${attachmentId}?${authQ}`;
@@ -124,7 +89,6 @@ async function fetchCardAttachmentMeta(cardId, attachmentId) {
 }
 
 async function downloadAttachmentBuffer(cardId, attachment) {
-  // If caller handed us full meta (with isUpload/url/name), use it; otherwise fetch it.
   const meta = (attachment && typeof attachment.isUpload !== 'undefined')
     ? attachment
     : await fetchCardAttachmentMeta(cardId, attachment.id);
@@ -134,7 +98,6 @@ async function downloadAttachmentBuffer(cardId, attachment) {
   const authQ = `key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
 
   if (isUpload) {
-    // Card-scoped download endpoint
     const dlUrl = `https://api.trello.com/1/cards/${cardId}/attachments/${attachment.id}/download?${authQ}`;
     const dl = await fetch(dlUrl);
     if (!dl.ok) throw new Error(`Attachment ${attachment.id} Trello download failed (${dl.status})`);
@@ -142,7 +105,6 @@ async function downloadAttachmentBuffer(cardId, attachment) {
     return { buffer: Buffer.from(ab), filename: name };
   }
 
-  // External link (must be public)
   const externalUrl = meta.url;
   if (!externalUrl) throw new Error(`Attachment ${attachment.id} is not an uploaded file and has no url`);
   const extRes = await fetch(externalUrl, { redirect: 'follow' });
@@ -182,43 +144,7 @@ function derivePageName(cardName) {
   return m || DEFAULT_PAGE_NAME;
 }
 
-// ---------- HTTP HELPERS (with retries) ----------
-async function postJSON(path, body, maxAttempts = 4) {
-  let attempt = 0, lastErr;
-  while (attempt < maxAttempts) {
-    attempt++;
-    try {
-      const resp = await fetch(API(path), {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${ADPILER_API_KEY}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        body: JSON.stringify(body || {})
-      });
-      const text = await resp.text();
-      let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
-      if (resp.ok) return json;
-      if (resp.status >= 500) {
-        const delay = 400 * 2 ** (attempt - 1) + Math.floor(Math.random() * 200);
-        console.warn(`AdPiler ${resp.status} on ${path} (attempt ${attempt}/${maxAttempts}) → retrying in ${delay}ms`);
-        await new Promise(r => setTimeout(r, delay));
-        continue;
-      }
-      throw new Error(`AdPiler ${resp.status} on ${path}: ${text}`);
-    } catch (e) {
-      lastErr = e;
-      if (attempt < maxAttempts) {
-        const delay = 400 * 2 ** (attempt - 1) + Math.floor(Math.random() * 200);
-        console.warn(`POST ${path} failed (attempt ${attempt}/${maxAttempts}): ${e.message}. Retrying in ${delay}ms...`);
-        await new Promise(r => setTimeout(r, delay));
-      }
-    }
-  }
-  throw lastErr || new Error(`POST ${path} failed after retries`);
-}
-
+// ---------- HTTP HELPERS ----------
 async function postForm(path, form, maxAttempts = 4) {
   let attempt = 0, lastErr;
   while (attempt < maxAttempts) {
@@ -253,34 +179,15 @@ async function postForm(path, form, maxAttempts = 4) {
   }
   throw lastErr || new Error(`POST form ${path} failed after retries`);
 }
-
-// ---------- ADPILER API STEPS ----------
-async function createSocialAd({ campaignId, card /*, attachments*/ }) {
+// ---------- ADPILER API ----------
+async function createSocialAd({ campaignId, card, type }) {
   const form = new FormData();
-  const name = card.name;
-  const network = FIXED_NETWORK;
-  const type = FIXED_TYPE;
-  const pageName = derivePageName(card.name);
-
-  form.append('name', name);
-  form.append('network', network);
+  form.append('name', card.name);
+  form.append('network', FIXED_NETWORK);
   form.append('type', type);
-  form.append('page_name', pageName);
+  form.append('page_name', derivePageName(card.name));
 
-  // Optional: attach logo from first attachment — disabled by default.
-  // If you want this, pass cardId & use downloadAttachmentBuffer(card.id, attachments[0])
-  /*
-  if (attachments && attachments.length) {
-    try {
-      const { buffer, filename } = await downloadAttachmentBuffer(card.id, attachments[0]);
-      form.append('logo', buffer, { filename: filename || `logo-${attachments[0].id}` });
-    } catch (e) {
-      console.warn('Could not attach logo from card:', e.message);
-    }
-  }
-  */
-
-  console.log(`Creating social ad → campaign=${campaignId}, name="${name}", network=${network}, type=${type}, page_name="${pageName}"`);
+  console.log(`Creating social ad → campaign=${campaignId}, type=${type}`);
   const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
 
   const adId = json.id || json.adId || json.data?.id;
@@ -290,7 +197,6 @@ async function createSocialAd({ campaignId, card /*, attachments*/ }) {
 
 async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
   const form = new FormData();
-
   if (meta.cta)            form.append('call_to_action',   meta.cta);
   if (meta.displayLink)    form.append('display_link',     meta.displayLink);
   if (meta.headline)       form.append('headline',         meta.headline);
@@ -321,6 +227,11 @@ async function uploadSlides({ cardId, adId, attachments, meta }) {
   let successCount = 0;
   let triedCount = 0;
 
+  // Ensure attachments are in correct order for carousel
+  attachments.sort((a, b) =>
+    (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' })
+  );
+
   for (const att of attachments || []) {
     if (!att || !att.id) continue;
     triedCount++;
@@ -345,7 +256,6 @@ async function uploadSlides({ cardId, adId, attachments, meta }) {
 
   return { previewUrls: allPreviewUrls };
 }
-
 // ---------- MAIN ENTRY ----------
 async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   assertEnv();
@@ -354,20 +264,37 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   const campaignId = mapping.campaignId || mapping.projectId || DEFAULT_PROJECT_ID;
   if (!campaignId) throw new Error('No campaignId found (CSV "Adpiler Campaign ID" or DEFAULT_PROJECT_ID required)');
 
+  // Detect carousel mode from card name
+  const isCarousel = card.name.toLowerCase().includes('carousel');
+
+  // Extract shared metadata from card description
   const meta = extractAdMetaFromCard(card);
 
-  // 1) Create Social Ad (multipart)
-  const { adId } = await createSocialAd({ campaignId, card /*, attachments*/ });
+  // Sort attachments so Slide 1, Slide 2, etc. are in correct order
+  attachments.sort((a, b) =>
+    (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' })
+  );
 
-  // 2) Upload all attachments as slides (multipart per file) — now card-scoped
-  const { previewUrls } = await uploadSlides({ cardId: card.id, adId, attachments, meta });
+  // 1) Create Social Ad with correct type
+  const adType = isCarousel ? 'carousel' : 'post';
+  const { adId } = await createSocialAd({ campaignId, card, type: adType });
+
+  // 2) Upload slides or single image
+  let previewUrls = [];
+  if (isCarousel && attachments.length > 1) {
+    const { previewUrls: urls } = await uploadSlides({ cardId: card.id, adId, attachments, meta });
+    previewUrls = urls;
+  } else if (attachments.length) {
+    const { buffer, filename } = await downloadAttachmentBuffer(card.id, attachments[0]);
+    previewUrls = await uploadOneSlide({ adId, fileBuf: buffer, filename, meta });
+  }
 
   // 3) Optional: comment back on Trello
   if (postTrelloComment) {
     const text = previewUrls?.length
       ? `Created AdPiler Social Ad (id: ${adId}) and uploaded ${attachments?.length || 0} slide(s):\n${previewUrls.join('\n')}`
       : `Created AdPiler Social Ad (id: ${adId}) and uploaded ${attachments?.length || 0} slide(s).`;
-    await postTrelloComment(card.id, text).catch(()=>{});
+    await postTrelloComment(card.id, text).catch(() => {});
   }
 
   return { adId, previewUrls };
