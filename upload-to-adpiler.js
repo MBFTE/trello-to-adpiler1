@@ -275,8 +275,8 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
     (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' })
   );
 
-  // 1) Create Social Ad with correct type
-  const adType = isCarousel ? 'carousel' : 'post';
+  // 1) Always create Social Ad as type=post (Adpiler handles multiple slides for carousel posts)
+  const adType = 'post';
   const { adId } = await createSocialAd({ campaignId, card, type: adType });
 
   // 2) Upload slides or single image
@@ -301,4 +301,3 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
 }
 
 module.exports = { uploadToAdpiler };
-
