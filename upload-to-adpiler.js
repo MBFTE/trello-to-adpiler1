@@ -180,14 +180,24 @@ async function postForm(path, form, maxAttempts = 4) {
   throw lastErr || new Error(`POST form ${path} failed after retries`);
 }
 // ---------- ADPILER API ----------
-async function createSocialAd({ campaignId, card, type }) {
+async function createSocialAd({ campaignId, card, type = 'post', isCarousel = false }) {
   const form = new FormData();
   form.append('name', card.name);
   form.append('network', FIXED_NETWORK);
-  form.append('type', type);
+  form.append('type', type); // always 'post' for FB unless docs say otherwise
   form.append('page_name', derivePageName(card.name));
 
-  console.log(`Creating social ad → campaign=${campaignId}, type=${type}`);
+  // If we know the extra field Adpiler expects for carousel, set it here:
+  const isCarousel = card.name.toLowerCase().includes('carousel');
+const { adId } = await createSocialAd({
+  campaignId,
+  card,
+  type: 'post', // keep as 'post' unless docs confirm another valid type
+  isCarousel
+});
+
+
+  console.log(`Creating social ad → campaign=${campaignId}, type=${type}, carousel=${isCarousel}`);
   const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
 
   const adId = json.id || json.adId || json.data?.id;
