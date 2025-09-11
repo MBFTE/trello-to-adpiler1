@@ -268,43 +268,28 @@ async function uploadSlides({ cardId, adId, attachments, meta }) {
 }
 // ---------- MAIN ENTRY ----------
 async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
-  assertEnv();
-
-  const mapping = await getClientMapping(card.name);
-  const campaignId = mapping.campaignId || mapping.projectId || DEFAULT_PROJECT_ID;
-  if (!campaignId) throw new Error('No campaignId found (CSV "Adpiler Campaign ID" or DEFAULT_PROJECT_ID required)');
-
-  // Detect carousel mode from card name
   const isCarousel = card.name.toLowerCase().includes('carousel');
+  const campaignId = process.env.DEFAULT_PROJECT_ID;
 
-  // Extract shared metadata from card description
-  const meta = extractAdMetaFromCard(card);
+  const meta = extractAdMetaFromCard(card); // optional helper
+  const adType = 'post'; // always 'post' for Facebook
 
-  // Sort attachments so Slide 1, Slide 2, etc. are in correct order
-  attachments.sort((a, b) =>
-    (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' })
-  );
+  const { adId } = await createSocialAd({ campaignId, card, type: adType, isCarousel });
 
-  // 1) Always create Social Ad as type=post (Adpiler handles multiple slides for carousel posts)
-  const adType = 'post';
-  const { adId } = await createSocialAd({ campaignId, card, type: adType });
+  const previewUrls = [];
 
-  // 2) Upload slides or single image
-  let previewUrls = [];
-  if (isCarousel && attachments.length > 1) {
-    const { previewUrls: urls } = await uploadSlides({ cardId: card.id, adId, attachments, meta });
-    previewUrls = urls;
-  } else if (attachments.length) {
-    const { buffer, filename } = await downloadAttachmentBuffer(card.id, attachments[0]);
-    previewUrls = await uploadOneSlide({ adId, fileBuf: buffer, filename, meta });
+  for (let i = 0; i < attachments.length; i++) {
+    const { buffer, filename } = await downloadAttachmentBuffer(card.id, attachments[i]);
+    const urls = await uploadOneSlide({ adId, fileBuf: buffer, filename, meta });
+    previewUrls.push(...urls);
+    await new Promise(r => setTimeout(r, 300)); // delay to avoid socket hang-up
   }
 
-  // 3) Optional: comment back on Trello
   if (postTrelloComment) {
-    const text = previewUrls?.length
-      ? `Created AdPiler Social Ad (id: ${adId}) and uploaded ${attachments?.length || 0} slide(s):\n${previewUrls.join('\n')}`
-      : `Created AdPiler Social Ad (id: ${adId}) and uploaded ${attachments?.length || 0} slide(s).`;
-    await postTrelloComment(card.id, text).catch(() => {});
+    const text = previewUrls.length
+      ? `Created AdPiler Social Ad (id: ${adId}) and uploaded ${attachments.length} attachments:\n${previewUrls.join('\n')}`
+      : `Created AdPiler Social Ad (id: ${adId}) and uploaded ${attachments.length} attachments.`;
+    postTrelloComment(card.id, text).catch(() => {});
   }
 
   return { adId, previewUrls };
