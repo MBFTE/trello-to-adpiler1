@@ -210,13 +210,6 @@ async function createSocialAd({ campaignId, card, type = 'post', isCarousel = fa
   if (!adId) throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
   return { adId, raw: json };
 
-
-  console.log(`Creating social ad → campaign=${campaignId}, type=${type}, carousel=${isCarousel}`);
-  const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
-
-  const adId = json.id || json.adId || json.data?.id;
-  if (!adId) throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
-  return { adId, raw: json };
 }
 
 async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
