@@ -161,13 +161,9 @@ async function postForm(path, form, maxAttempts = 4) {
       const text = await resp.text();
       let parsed;
 try {
-  parsed = JSON.parse(text);
-} catch {
-  parsed = { raw: text };
-}
-
-      catch {
-  parsed = { raw: text };
+  json = JSON.parse(text);
+} catch (e) {
+  json = { raw: text };
 }
       if (resp.ok) return json;
       if (resp.status >= 500) {
