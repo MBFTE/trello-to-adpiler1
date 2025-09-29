@@ -1,8 +1,12 @@
 /**
- * Trello → AdPiler uploader
- * Supports both:
- *  - ONE multi-slide ad (if tenant accepts a multi type), OR
- *  - Fallback: one POST ad per image when multi types are rejected.
+ * Trello → AdPiler uploader (Facebook Social Ads)
+ * Implements developer guidance:
+ *  - Two key fields: "paid" ('true' | 'false') + "type"
+ *  - Valid types: 'post', 'post-carousel', 'story', 'story-carousel'
+ *  - Multi-slide legality depends on (paid,type) pair
+ *  - Preview URL must be constructed manually:
+ *      https://<PREVIEW_DOMAIN>/<CAMPAIGN_CODE>?ad=<AD_ID>
+ *    where PREVIEW_DOMAIN defaults to preview.adpiler.com (or env override)
  */
 
 const fetch = require('node-fetch');
@@ -12,8 +16,6 @@ const { URL } = require('url');
 
 // ---------- FIXED VALUES ----------
 const FIXED_NETWORK = 'facebook';
-const POST_TYPE = 'post';
-const MULTI_TYPE_CANDIDATES = ['carousel', 'album', 'multi', 'gallery', 'slideshow'];
 const DEFAULT_PAGE_NAME = 'Adpiler';
 
 // ---------- ENV ----------
@@ -24,6 +26,9 @@ const {
   TRELLO_TOKEN,
   DEFAULT_CLIENT_ID = '',
   DEFAULT_PROJECT_ID = '',
+  // Optional behavior knobs (no env change required; sensible defaults)
+  ADPILER_PREVIEW_DOMAIN = 'preview.adpiler.com', // can be whitelabel domain if you have it
+  ADPILER_PAID_DEFAULT = 'true',                  // default to paid ads
 } = process.env;
 
 const _API_BASE = (process.env.ADPILER_API_BASE || process.env.ADPILER_BASE_URL || '').trim();
@@ -61,7 +66,9 @@ async function getClientMapping(cardName) {
   const rows = await csv().fromString(await res.text());
 
   const lcCard = normalize(cardName);
+  // First try: contains match (helps with "Client: Campaign" titles)
   let row = rows.find(r => lcCard.includes(normalize(r['Trello Client Name'])));
+  // Fallback: exact match
   if (!row) row = rows.find(r => normalize(r['Trello Client Name']) === lcCard);
 
   if (row) {
@@ -115,6 +122,7 @@ async function downloadAttachmentBuffer(cardId, attachment) {
   return { buffer: Buffer.from(ab), filename: name };
 }
 
+// ---------- Extract creative metadata from card description ----------
 function extractAdMetaFromCard(card) {
   const desc = card.desc || '';
   const grab = (label) => {
@@ -138,7 +146,7 @@ function derivePageName(cardName) {
   return m || DEFAULT_PAGE_NAME;
 }
 
-// ---------- HTTP (with retries) ----------
+// ---------- HTTP HELPERS (no retry on 4xx) ----------
 async function postForm(path, form, maxAttempts = 4) {
   let attempt = 0, lastErr;
   while (attempt < maxAttempts) {
@@ -151,6 +159,7 @@ async function postForm(path, form, maxAttempts = 4) {
       });
       const text = await resp.text();
       let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
+
       if (resp.ok) return json;
 
       if (resp.status >= 500) {
@@ -159,8 +168,16 @@ async function postForm(path, form, maxAttempts = 4) {
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
-      throw new Error(`AdPiler ${resp.status} on ${path}: ${text}`);
+
+      const err = new Error(`AdPiler ${resp.status} on ${path}: ${text}`);
+      err.status = resp.status;
+      err.body = json;
+      throw err;
+
     } catch (e) {
+      if (e && typeof e.status === 'number' && e.status < 500) {
+        throw e; // 4xx or other non-retryable
+      }
       lastErr = e;
       if (attempt < maxAttempts) {
         const delay = 400 * (2 ** (attempt - 1)) + Math.floor(Math.random() * 200);
@@ -172,42 +189,82 @@ async function postForm(path, form, maxAttempts = 4) {
   throw lastErr || new Error(`POST form ${path} failed after retries`);
 }
 
+async function getJSON(path) {
+  const r = await fetch(API(path), { headers: { 'Authorization': `Bearer ${ADPILER_API_KEY}` } });
+  const text = await r.text();
+  let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!r.ok) throw new Error(`AdPiler GET ${path} → ${r.status}: ${text}`);
+  return json;
+}
+
+// ---------- PREVIEW URL ----------
+async function getCampaignCode(campaignId) {
+  const data = await getJSON(`campaigns/${encodeURIComponent(campaignId)}`);
+  // Expecting an object with a "code" field
+  return data.code || data.data?.code || '';
+}
+
+function buildPreviewUrl({ domain = ADPILER_PREVIEW_DOMAIN, campaignCode, adId }) {
+  const base = `https://${domain.replace(/^https?:\/\//, '')}/${encodeURIComponent(campaignCode)}`;
+  return adId ? `${base}?ad=${encodeURIComponent(adId)}` : base;
+}
+
+// ---------- Type selection (paid + type) ----------
+function decidePaidAndType({ cardName, attachmentCount }) {
+  const lc = normalize(cardName);
+  const isStory = /\bstory\b/.test(lc);           // title contains "story"
+  const isOrganic = /\borganic\b/.test(lc);       // title contains "organic"
+  const isPaidDefault = String(ADPILER_PAID_DEFAULT || 'true').toLowerCase() !== 'false';
+  const paid = isOrganic ? 'false' : (isPaidDefault ? 'true' : 'false');
+
+  // Rules from developer:
+  // ORGANIC (paid=false):
+  //   - post: one or more slides
+  //   - story: single slide
+  //   - story-carousel: one or more slides
+  //
+  // PAID (paid=true):
+  //   - post: single slide
+  //   - post-carousel: one or more slides
+  //   - story: single slide
+  //   - story-carousel: one or more slides
+
+  if (paid === 'false') { // organic
+    if (isStory) {
+      return attachmentCount > 1
+        ? { paid, type: 'story-carousel', multiAllowed: true }
+        : { paid, type: 'story',           multiAllowed: false };
+    }
+    // Organic post supports multiple slides
+    return { paid, type: 'post', multiAllowed: attachmentCount > 1 };
+  }
+
+  // paid === 'true' (ads)
+  if (isStory) {
+    return attachmentCount > 1
+      ? { paid, type: 'story-carousel', multiAllowed: true }
+      : { paid, type: 'story',           multiAllowed: false };
+  }
+  // Non-story paid: for multiples use post-carousel; single uses post
+  return attachmentCount > 1
+    ? { paid, type: 'post-carousel', multiAllowed: true }
+    : { paid, type: 'post',          multiAllowed: false };
+}
+
 // ---------- AdPiler: Create ----------
-async function tryCreateAd({ campaignId, card, typeVal }) {
+async function createSocialAd({ campaignId, card, paid, type }) {
   const form = new FormData();
   form.append('name', card.name);
   form.append('network', FIXED_NETWORK);
-  form.append('type', typeVal);
   form.append('page_name', derivePageName(card.name));
+  form.append('paid', paid);     // 'true' | 'false'
+  form.append('type', type);     // 'post' | 'post-carousel' | 'story' | 'story-carousel'
 
-  console.log(`Creating social ad → campaign=${campaignId}, name="${card.name}", network=${FIXED_NETWORK}, type=${typeVal}, page_name="${derivePageName(card.name)}"`);
+  console.log(`Creating social ad → campaign=${campaignId}, name="${card.name}", network=${FIXED_NETWORK}, paid=${paid}, type=${type}, page_name="${derivePageName(card.name)}"`);
   const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
   const adId = json.id || json.adId || json.data?.id;
   if (!adId) throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
-  return { adId, raw: json, typeUsed: typeVal };
-}
-
-async function createBestAd({ campaignId, card, wantMulti }) {
-  if (wantMulti) {
-    for (const t of MULTI_TYPE_CANDIDATES) {
-      try {
-        const made = await tryCreateAd({ campaignId, card, typeVal: t });
-        made.supportsMulti = true; // by design, these types are multi
-        return made;
-      } catch (e) {
-        const msg = String(e?.message || '').toLowerCase();
-        if (msg.includes('selected type is invalid') || msg.includes('"type"') && msg.includes('invalid')) {
-          console.warn(`Type "${t}" rejected by tenant; trying next candidate...`);
-          continue;
-        }
-        throw e; // other error—bubble up
-      }
-    }
-    console.warn('All multi-slide types rejected; falling back to "post" (one slide per ad).');
-  }
-  const made = await tryCreateAd({ campaignId, card, typeVal: POST_TYPE });
-  made.supportsMulti = false;
-  return made;
+  return { adId, raw: json, paid, type };
 }
 
 // ---------- Slides ----------
@@ -232,48 +289,42 @@ async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
 
   const json = await postForm(`social-ads/${encodeURIComponent(adId)}/slides`, form);
 
-  const previewUrls = [];
-  const push = (v) => { if (v && typeof v === 'string') previewUrls.push(v); };
-
-  if (json.preview_url) push(json.preview_url);
-  if (Array.isArray(json.preview_urls)) json.preview_urls.forEach(push);
-  if (Array.isArray(json.links)) json.links.forEach(push);
-  if (json.data && Array.isArray(json.data)) {
-    json.data.forEach(item => {
-      push(item.preview_url);
-      if (item.links) (Array.isArray(item.links) ? item.links : [item.links]).forEach(push);
-    });
-  }
-  return previewUrls;
+  // API does NOT return preview_url; we will construct it later.
+  // Still parse for any helpful info:
+  return {
+    raw: json
+  };
 }
 
-async function uploadSlidesToAd({ cardId, adId, attachments, meta }) {
-  const allPreviewUrls = [];
-  let successCount = 0;
-
+async function uploadSlidesToAd({ cardId, adId, attachments, meta, allowMultiple }) {
+  const uploaded = [];
   const sorted = (attachments || []).slice().sort((a, b) =>
     (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' })
   );
 
+  let count = 0;
   for (const att of sorted) {
     if (!att || !att.id) continue;
+
+    // If multiple not allowed, only the first slide is legal
+    if (!allowMultiple && count >= 1) break;
+
     try {
       const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
-      const urls = await uploadOneSlide({ adId, fileBuf: buffer, filename: filename || `asset-${att.id}`, meta });
-      allPreviewUrls.push(...(urls || []));
-      successCount++;
+      const res = await uploadOneSlide({ adId, fileBuf: buffer, filename: filename || `asset-${att.id}`, meta });
+      uploaded.push({ attachmentId: att.id, filename: filename || att.name, result: res.raw });
+      count++;
       await new Promise(r => setTimeout(r, 200));
     } catch (e) {
       console.warn(`⚠️ Slide upload failed for ${att.id} (${att.name || ''}): ${e.message}`);
-      // If API enforces "only 1 slide" on this type, it will error here.
-      const msg = String(e?.message || '').toLowerCase();
-      if (msg.includes("can't have more than 1 slide") || msg.includes('more than 1 slide')) {
-        throw new Error('SINGLE_SLIDE_LIMIT');
-      }
     }
   }
 
-  return { previewUrls: allPreviewUrls, successCount };
+  if (uploaded.length === 0 && (attachments?.length || 0) > 0) {
+    throw new Error('No attachments could be uploaded (check that at least one is an uploaded Trello file or a public URL).');
+  }
+
+  return uploaded;
 }
 
 // ---------- Main entry ----------
@@ -290,84 +341,53 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   }
   if (!campaignId) throw new Error('No campaignId found (CSV "Adpiler Campaign ID" or DEFAULT_PROJECT_ID required)');
 
+  // Decide paid + type from card name + attachment count
   const meta = extractAdMetaFromCard(card);
-  const wantMulti = (attachments && attachments.length > 1) || /carousel/i.test(card.name);
+  const { paid, type, multiAllowed } = decidePaidAndType({
+    cardName: card.name,
+    attachmentCount: attachments?.length || 0
+  });
 
-  // 1) Create the best possible ad for this card
-  const { adId, typeUsed, supportsMulti } = await createBestAd({ campaignId, card, wantMulti });
+  // 1) Create the ad with correct paid/type
+  const { adId } = await createSocialAd({ campaignId, card, paid, type });
 
-  let createdAdsSummary = [`Ad ${adId} (type: ${typeUsed || (supportsMulti ? 'multi' : 'post')})`];
-  let previewUrls = [];
+  // 2) Upload slides (obey the multiAllowed rule for this paid/type pair)
+  const uploaded = await uploadSlidesToAd({
+    cardId: card.id,
+    adId,
+    attachments,
+    meta,
+    allowMultiple: !!multiAllowed
+  });
 
-  if (!supportsMulti) {
-    // Tenant rejected all multi types → create one POST per image (fallback)
-    if (wantMulti && (attachments?.length || 0) > 1) {
-      console.warn('Multi not supported; creating one POST per image as fallback.');
-      const created = [];
-      for (const att of (attachments || [])) {
-        try {
-          // Fresh ad for this image
-          const single = await tryCreateAd({ campaignId, card, typeVal: POST_TYPE });
-          const { buffer, filename } = await downloadAttachmentBuffer(card.id, att);
-          const urls = await uploadOneSlide({ adId: single.adId, fileBuf: buffer, filename: filename || att.name || `asset-${att.id}`, meta });
-          created.push({ adId: single.adId, filename: filename || att.name, previewUrls: urls });
-          previewUrls.push(...(urls || []));
-          await new Promise(r => setTimeout(r, 200));
-        } catch (e) {
-          console.warn(`⚠️ Fallback POST creation/upload failed for attachment ${att.id}: ${e.message}`);
-        }
-      }
-      createdAdsSummary = created.map(c => `Ad ${c.adId}${c.filename ? ` (${c.filename})` : ''}`);
-    } else {
-      // Single attachment → just upload to the one POST we made above
-      const { previewUrls: urls } = await uploadSlidesToAd({ cardId: card.id, adId, attachments, meta });
-      previewUrls.push(...(urls || []));
+  // 3) Build preview URL
+  let previewUrl = '';
+  try {
+    const campaignCode = await getCampaignCode(campaignId);
+    if (campaignCode) {
+      previewUrl = buildPreviewUrl({ campaignCode, adId });
     }
-  } else {
-    // Multi supported → upload all slides to the single ad
-    try {
-      const { previewUrls: urls } = await uploadSlidesToAd({ cardId: card.id, adId, attachments, meta });
-      previewUrls.push(...(urls || []));
-    } catch (e) {
-      if (e.message === 'SINGLE_SLIDE_LIMIT') {
-        // Server still enforced single-slide; do fallback posts for remaining files
-        console.warn('Server enforced single-slide on purported multi ad; creating POSTs for remaining files.');
-        const remaining = (attachments || []).slice(1);
-        for (const att of remaining) {
-          try {
-            const single = await tryCreateAd({ campaignId, card, typeVal: POST_TYPE });
-            const { buffer, filename } = await downloadAttachmentBuffer(card.id, att);
-            const urls = await uploadOneSlide({ adId: single.adId, fileBuf: buffer, filename: filename || att.name || `asset-${att.id}`, meta });
-            createdAdsSummary.push(`Ad ${single.adId}${filename ? ` (${filename})` : ''}`);
-            previewUrls.push(...(urls || []));
-          } catch (err) {
-            console.warn(`⚠️ Fallback POST creation/upload failed for attachment ${att.id}: ${err.message}`);
-          }
-          await new Promise(r => setTimeout(r, 200));
-        }
-      } else {
-        throw e;
-      }
-    }
+  } catch (e) {
+    console.warn('Preview URL build warning:', e.message);
   }
 
-  // 3) Comment back to Trello
+  // 4) Comment back to Trello (best-effort)
   if (postTrelloComment) {
     const lines = [];
-    if (createdAdsSummary.length === 1) {
-      lines.push(`Created AdPiler ad ${createdAdsSummary[0]} and uploaded ${attachments?.length || 0} attachment(s).`);
-    } else {
-      lines.push(`Created ${createdAdsSummary.length} AdPiler ad(s):`);
-      for (const s of createdAdsSummary) lines.push(`• ${s}`);
-      lines.push(`Uploaded ${attachments?.length || 0} attachment(s) in total.`);
+    lines.push(`Created AdPiler Social Ad (id: ${adId}, paid: ${paid}, type: ${type}).`);
+    lines.push(`Uploaded ${uploaded.length} slide(s) out of ${attachments?.length || 0}.`);
+    if (!multiAllowed && (attachments?.length || 0) > 1) {
+      lines.push(`Note: "${type}" supports only 1 slide for paid=${paid}.`);
     }
-    if (previewUrls?.length) lines.push(previewUrls.join('\n'));
+    if (previewUrl) lines.push(previewUrl);
     try { await postTrelloComment(card.id, lines.join('\n')); } catch {}
   }
 
-  return { adId, previewUrls };
+  // Return constructed preview and adId
+  return { adId, previewUrls: previewUrl ? [previewUrl] : [] };
 }
 
 // Export both named and default to be safe with require()
 module.exports = { uploadToAdpiler };
 module.exports.default = uploadToAdpiler;
+
