@@ -1,10 +1,9 @@
 /**
  * Trello → AdPiler uploader (Facebook Social Ads)
- * - Uses valid schema: { paid: 'true'|'false', type: 'post'|'post-carousel'|'story'|'story-carousel' }
- * - Chooses multi/single slide legality based on (paid, type) + attachment count
- * - Uploads ONE ad, then adds slides to that SAME ad (all slides when allowed)
- * - Constructs preview URL (CSV code → ENV override → GET /campaigns/{id})
- * - Comments results back to Trello (filenames + preview link)
+ * - Valid schema: { paid: 'true'|'false', type: 'post'|'post-carousel'|'story'|'story-carousel' }
+ * - Creates ONE ad then uploads slides to that same ad
+ * - Pulls Primary Text / Headline / CTA / URL from card Description or a checklist named "Ad Meta"
+ * - Preview URL: CSV code -> env override -> API fallback
  */
 
 const fetch = require('node-fetch');
@@ -24,9 +23,9 @@ const {
   TRELLO_TOKEN,
   DEFAULT_CLIENT_ID = '',
   DEFAULT_PROJECT_ID = '',
-  ADPILER_PREVIEW_DOMAIN = 'preview.adpiler.com', // your whitelabel domain if any; default works
-  ADPILER_PAID_DEFAULT = 'true',                  // default: create paid ads unless "organic" in title
-  ADPILER_CAMPAIGN_CODE_OVERRIDE,                 // optional: bypass GET /campaigns/{id} if it 500s
+  ADPILER_PREVIEW_DOMAIN = 'preview.adpiler.com',
+  ADPILER_PAID_DEFAULT = 'true',          // default to paid ads unless "organic" in title
+  ADPILER_CAMPAIGN_CODE_OVERRIDE,         // optional manual campaign code
 } = process.env;
 
 const _API_BASE = (process.env.ADPILER_API_BASE || process.env.ADPILER_BASE_URL || '').trim();
@@ -50,19 +49,11 @@ async function getClientMapping(cardName) {
     clientId: String(DEFAULT_CLIENT_ID || '').trim(),
     campaignId: String(DEFAULT_PROJECT_ID || '').trim(),
     folderId: '',
-    campaignCode: '',
+    campaignCode: ''
   };
 
   if (!CLIENT_CSV_URL) {
-    if (fallback.clientId) {
-      return {
-        clientId: fallback.clientId,
-        projectId: fallback.campaignId,
-        folderId: '',
-        campaignId: fallback.campaignId,
-        campaignCode: fallback.campaignCode,
-      };
-    }
+    if (fallback.clientId) return { ...fallback };
     throw new Error('CLIENT_CSV_URL not set and no DEFAULT_CLIENT_ID provided');
   }
 
@@ -71,7 +62,7 @@ async function getClientMapping(cardName) {
   const rows = await csv().fromString(await res.text());
 
   const lcCard = normalize(cardName);
-  // helpful for titles like "Client: Campaign - ..."
+  // Try "contains" first to handle titles like "Client: Campaign - ..."
   let row = rows.find(r => lcCard.includes(normalize(r['Trello Client Name'])));
   if (!row) row = rows.find(r => normalize(r['Trello Client Name']) === lcCard);
 
@@ -79,30 +70,17 @@ async function getClientMapping(cardName) {
     const clientId     = String(row['Adpiler Client ID'] || '').trim();
     const folderId     = String(row['Adpiler Folder ID'] || '').trim();
     const campaignId   = String(row['Adpiler Campaign ID'] || '').trim();
-    const campaignCode = String(row['Adpiler Campaign Code'] || '').trim(); // <-- optional CSV column
-
-    if (clientId && campaignId) {
-      return { clientId, projectId: campaignId, folderId, campaignId, campaignCode };
-    }
-    console.warn(`CSV match for "${cardName}" missing required fields; falling back.`);
+    const campaignCode = String(row['Adpiler Campaign Code'] || '').trim(); // optional column
+    if (clientId && campaignId) return { clientId, projectId: campaignId, folderId, campaignId, campaignCode };
+    console.warn(`CSV match for "${cardName}" missing required fields; falling back to defaults.`);
   } else {
     console.warn(`No CSV match for "${cardName}".`);
   }
 
-  if (fallback.clientId && fallback.campaignId) {
-    return {
-      clientId: fallback.clientId,
-      projectId: fallback.campaignId,
-      folderId: '',
-      campaignId: fallback.campaignId,
-      campaignCode: fallback.campaignCode
-    };
-  }
-
-  throw new Error(`No valid client mapping found for card "${cardName}"`);
+  return { ...fallback };
 }
 
-// ---------- TRELLO ATTACHMENT HELPERS (card-scoped) ----------
+// ---------- TRELLO ATTACHMENT HELPERS ----------
 async function fetchCardAttachmentMeta(cardId, attachmentId) {
   const authQ = `key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}`;
   const url = `https://api.trello.com/1/cards/${cardId}/attachments/${attachmentId}?${authQ}`;
@@ -136,23 +114,75 @@ async function downloadAttachmentBuffer(cardId, attachment) {
   return { buffer: Buffer.from(ab), filename: name };
 }
 
-// ---------- CARD DESCRIPTION PARSING ----------
+// ---------- CARD META PARSING ----------
 function extractAdMetaFromCard(card) {
+  const norm = (s) => (s || '').trim();
+  const isBlank = (s) => !s || /^leave\s+blank$/i.test(String(s).trim());
+
+  // 1) parse from description
   const desc = card.desc || '';
   const grab = (label) => {
-    const m = desc.match(new RegExp(`${label}:\\s*(.+)`, 'i'));
+    // match start-of-line "Label: value" (case-insensitive, multiline)
+    const m = desc.match(new RegExp(`^\\s*${label}\\s*:\\s*(.+)$`, 'im'));
     return m ? m[1].trim() : '';
   };
 
-  const headline     = grab('Headline');
-  const description  = grab('Description');
-  const cta          = grab('CTA') || grab('Call to Action') || grab('Call_to_action');
-  const url          = grab('URL') || grab('Landing Page') || grab('Landing_page_url');
+  // 2) parse from checklist named "Ad Meta" if present
+  let clVals = {};
+  try {
+    const metaChecklist = (card.checklists || []).find(cl =>
+      String(cl.name || '').toLowerCase().trim() === 'ad meta'
+    );
+    if (metaChecklist) {
+      for (const it of metaChecklist.checkItems || []) {
+        const txt = String(it.name || '');
+        const mm = txt.match(/^\s*([^:]+)\s*:\s*(.+)$/);
+        if (mm) clVals[mm[1].toLowerCase().trim()] = mm[2].trim();
+      }
+    }
+  } catch {}
+
+  // pick: prefer checklist → description
+  const pick = (label, ...aliases) => {
+    const keys = [label, ...aliases].map(k => k.toLowerCase());
+    for (const k of keys) {
+      if (clVals[k]) return clVals[k];
+    }
+    for (const k of [label, ...aliases]) {
+      const v = grab(k);
+      if (v) return v;
+    }
+    return '';
+  };
+
+  const primaryText = pick('Primary Text', 'Primary', 'Body', 'Post Text');
+  const headline    = pick('Headline', 'Title');
+  const cta         = pick('Call To Action', 'CTA');
+  const url         = pick('Landing Page URL', 'URL', 'Link', 'Landing Page');
+
+  // Description field (optional override). If empty, use Primary Text as API "description".
+  let description = pick('Description');
+  if (!description) description = primaryText;
+
+  // Respect "LEAVE BLANK"
+  const clean = (s) => (isBlank(s) ? '' : norm(s));
+  const cleanedUrl = clean(url);
 
   let displayLink = '';
-  try { if (url) displayLink = new URL(url).hostname.replace(/^www\./, ''); } catch {}
+  try {
+    if (cleanedUrl) {
+      const u = new URL(cleanedUrl);
+      displayLink = u.hostname.replace(/^www\./, '');
+    }
+  } catch {}
 
-  return { headline, description, cta, url, displayLink };
+  return {
+    headline:    clean(headline),
+    description: clean(description),   // maps to AdPiler "description" (FB primary text)
+    cta:         clean(cta),
+    url:         cleanedUrl,
+    displayLink
+  };
 }
 
 function derivePageName(cardName) {
@@ -162,7 +192,7 @@ function derivePageName(cardName) {
 
 // ---------- HTTP HELPERS ----------
 async function postForm(path, form, maxAttempts = 4) {
-  // Retries ONLY on 5xx or network errors, never on 4xx
+  // Retries ONLY on 5xx/network; never on 4xx
   let attempt = 0, lastErr;
   while (attempt < maxAttempts) {
     attempt++;
@@ -191,7 +221,7 @@ async function postForm(path, form, maxAttempts = 4) {
 
     } catch (e) {
       if (e && typeof e.status === 'number' && e.status < 500) {
-        throw e; // 4xx or other non-retryable
+        throw e; // 4xx: do not retry
       }
       lastErr = e;
       if (attempt < maxAttempts) {
@@ -217,34 +247,44 @@ function buildPreviewUrl({ domain = ADPILER_PREVIEW_DOMAIN, campaignCode, adId }
   const base = `https://${domain.replace(/^https?:\/\//, '')}/${encodeURIComponent(campaignCode)}`;
   return adId ? `${base}?ad=${encodeURIComponent(adId)}` : base;
 }
-
-async function getCampaignCode(campaignId, mapping) {
-  // Priority: CSV code → ENV override → API
-  if (mapping?.campaignCode) return mapping.campaignCode;
-  if (ADPILER_CAMPAIGN_CODE_OVERRIDE) return ADPILER_CAMPAIGN_CODE_OVERRIDE;
+async function getCampaignCodeViaApi(campaignId) {
   const data = await getJSON(`campaigns/${encodeURIComponent(campaignId)}`);
   return data.code || data.data?.code || '';
 }
 
-// ---------- CHOOSE paid + type ----------
+// Optional: try multiple preview variants and pick a 2xx
+async function httpOkay(url) {
+  try {
+    const r = await fetch(url, { method: 'GET' });
+    return r.ok;
+  } catch { return false; }
+}
+async function resolvePreviewUrl({ domain, campaignCode, adId }) {
+  const base = `https://${domain.replace(/^https?:\/\//, '')}/${encodeURIComponent(campaignCode)}`;
+  const candidates = [
+    `${base}?ad=${encodeURIComponent(adId)}`,
+    base,
+  ];
+  if (!/preview\.adpiler\.com$/i.test(domain)) {
+    const defBase = `https://preview.adpiler.com/${encodeURIComponent(campaignCode)}`;
+    candidates.push(`${defBase}?ad=${encodeURIComponent(adId)}`, defBase);
+  }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    for (const u of candidates) {
+      if (await httpOkay(u)) return u;
+    }
+    await new Promise(r => setTimeout(r, 800 * (attempt + 1)));
+  }
+  return `${base}?ad=${encodeURIComponent(adId)}`; // last resort
+}
+
+// ---------- DECIDE paid + type ----------
 function decidePaidAndType({ cardName, attachmentCount }) {
   const lc = normalize(cardName);
-  const isStory = /\bstory\b/.test(lc);      // title contains "story"
-  const isOrganic = /\borganic\b/.test(lc);  // title contains "organic"
+  const isStory = /\bstory\b/.test(lc);
+  const isOrganic = /\borganic\b/.test(lc);
   const paidDefault = String(ADPILER_PAID_DEFAULT || 'true').toLowerCase() !== 'false';
   const paid = isOrganic ? 'false' : (paidDefault ? 'true' : 'false');
-
-  // From AdPiler developer:
-  // ORGANIC (paid=false):
-  //   - post -> one or more slides
-  //   - story -> single slide
-  //   - story-carousel -> one or more slides
-  //
-  // PAID (paid=true):
-  //   - post -> single slide
-  //   - post-carousel -> one or more slides
-  //   - story -> single slide
-  //   - story-carousel -> one or more slides
 
   if (paid === 'false') { // organic
     if (isStory) {
@@ -252,17 +292,15 @@ function decidePaidAndType({ cardName, attachmentCount }) {
         ? { paid, type: 'story-carousel', multiAllowed: true }
         : { paid, type: 'story',           multiAllowed: false };
     }
-    // Organic post supports multiple
     return { paid, type: 'post', multiAllowed: attachmentCount > 1 };
   }
 
-  // paid === 'true' (ads)
+  // paid ads
   if (isStory) {
     return attachmentCount > 1
       ? { paid, type: 'story-carousel', multiAllowed: true }
       : { paid, type: 'story',           multiAllowed: false };
   }
-  // Non-story paid: multi → post-carousel, single → post
   return attachmentCount > 1
     ? { paid, type: 'post-carousel', multiAllowed: true }
     : { paid, type: 'post',          multiAllowed: false };
@@ -292,7 +330,6 @@ async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
   if (meta.headline)    form.append('headline',         meta.headline);
   if (meta.description) form.append('description',      meta.description);
 
-  // Only send landing_page_url if absolute & valid
   try {
     if (meta.url) {
       const u = new URL(meta.url);
@@ -318,8 +355,6 @@ async function uploadSlidesToAd({ cardId, adId, attachments, meta, allowMultiple
   let count = 0;
   for (const att of sorted) {
     if (!att || !att.id) continue;
-
-    // If multi not allowed, only the first slide is legal
     if (!allowMultiple && count >= 1) break;
 
     try {
@@ -328,7 +363,7 @@ async function uploadSlidesToAd({ cardId, adId, attachments, meta, allowMultiple
       uploaded.push({ attachmentId: att.id, filename: filename || att.name, result: res.raw });
       console.log(`📎 Added slide ${count + 1}: ${filename || att.name}`);
       count++;
-      await new Promise(r => setTimeout(r, 200)); // gentle pacing
+      await new Promise(r => setTimeout(r, 200));
     } catch (e) {
       console.warn(`⚠️ Slide upload failed for ${att.id} (${att.name || ''}): ${e.message}`);
     }
@@ -341,32 +376,32 @@ async function uploadSlidesToAd({ cardId, adId, attachments, meta, allowMultiple
   return uploaded;
 }
 
-// ---------- MAIN ENTRY ----------
+// ---------- MAIN ----------
 async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   assertEnv();
 
-  // 0) Resolve mapping and campaignId (use this mapping later for preview code)
+  // 0) mapping/campaign
   let mapping;
   try {
     mapping = await getClientMapping(card.name);
   } catch (e) {
-    console.warn(`Mapping lookup failed; using DEFAULT_PROJECT_ID. Reason: ${e.message}`);
-    mapping = { clientId: DEFAULT_CLIENT_ID, campaignId: DEFAULT_PROJECT_ID, projectId: DEFAULT_PROJECT_ID, folderId: '', campaignCode: '' };
+    console.warn(`Mapping lookup failed; using defaults. Reason: ${e.message}`);
+    mapping = { clientId: DEFAULT_CLIENT_ID, campaignId: DEFAULT_PROJECT_ID, campaignCode: '' };
   }
   const campaignId = mapping.campaignId || mapping.projectId || DEFAULT_PROJECT_ID;
   if (!campaignId) throw new Error('No campaignId found (CSV "Adpiler Campaign ID" or DEFAULT_PROJECT_ID required)');
 
-  // 1) Decide paid + type based on card + attachments
+  // 1) decide paid/type
   const meta = extractAdMetaFromCard(card);
   const { paid, type, multiAllowed } = decidePaidAndType({
     cardName: card.name,
     attachmentCount: attachments?.length || 0
   });
 
-  // 2) Create the ONE ad
+  // 2) create ad
   const { adId } = await createSocialAd({ campaignId, card, paid, type });
 
-  // 3) Upload slides to that same ad (obeying multiAllowed)
+  // 3) upload slides
   const uploaded = await uploadSlidesToAd({
     cardId: card.id,
     adId,
@@ -375,31 +410,42 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
     allowMultiple: !!multiAllowed
   });
 
-  // 4) Build preview URL (CSV code → ENV override → API)
+  // 4) preview URL (CSV code → env override → API; then probe for a 2xx)
   let previewUrl = '';
   try {
-    const campaignCode = await getCampaignCode(campaignId, mapping);
-    if (campaignCode) previewUrl = buildPreviewUrl({ campaignCode, adId });
+    let campaignCode = mapping.campaignCode || ADPILER_CAMPAIGN_CODE_OVERRIDE || '';
+    if (!campaignCode) campaignCode = await getCampaignCodeViaApi(campaignId);
+    if (campaignCode) {
+      previewUrl = await resolvePreviewUrl({
+        domain: ADPILER_PREVIEW_DOMAIN,
+        campaignCode,
+        adId
+      });
+    } else {
+      console.warn('Preview URL: no campaign code available (CSV/override/API all empty).');
+    }
   } catch (e) {
     console.warn('Preview URL build warning:', e.message);
   }
 
-  // 5) Comment back to Trello (best-effort)
+  // 5) Trello comment
   if (postTrelloComment) {
     const lines = [];
     lines.push(`Created AdPiler Social Ad (id: ${adId}, paid: ${paid}, type: ${type}).`);
     lines.push(`Uploaded ${uploaded.length} slide(s) out of ${attachments?.length || 0}:`);
     for (const u of uploaded) lines.push(`• ${u.filename || u.attachmentId}`);
-    if (!multiAllowed && (attachments?.length || 0) > 1) {
-      lines.push(`Note: "${type}" supports only 1 slide for paid=${paid}.`);
-    }
-    if (previewUrl) lines.push(previewUrl);
+    // include meta summary
+    lines.push('—');
+    if (meta.description) lines.push(`Primary Text: ${meta.description.substring(0,120)}${meta.description.length>120?'…':''}`);
+    if (meta.headline)    lines.push(`Headline: ${meta.headline}`);
+    if (meta.cta)         lines.push(`CTA: ${meta.cta}`);
+    if (meta.url)         lines.push(`URL: ${meta.url}`);
+    if (previewUrl)       lines.push(previewUrl);
     try { await postTrelloComment(card.id, lines.join('\n')); } catch {}
   }
 
   return { adId, previewUrls: previewUrl ? [previewUrl] : [] };
 }
 
-// Export for server.js
 module.exports = { uploadToAdpiler };
 module.exports.default = uploadToAdpiler;
