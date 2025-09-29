@@ -3,7 +3,8 @@
  * - Valid schema: { paid: 'true'|'false', type: 'post'|'post-carousel'|'story'|'story-carousel' }
  * - Creates ONE ad then uploads slides to that same ad
  * - Pulls Primary Text / Headline / CTA / URL from card Description or a checklist named "Ad Meta"
- * - Preview URL: CSV code -> env override -> API fallback
+ * - Sets ad-level "message" so the top text is no longer "Your message here"
+ * - Preview URL: CSV code -> env override -> API fallback (+ probing)
  */
 
 const fetch = require('node-fetch');
@@ -178,7 +179,7 @@ function extractAdMetaFromCard(card) {
 
   return {
     headline:    clean(headline),
-    description: clean(description),   // maps to AdPiler "description" (FB primary text)
+    description: clean(description),   // maps to AdPiler "message" (ad-level) and slide "description"
     cta:         clean(cta),
     url:         cleanedUrl,
     displayLink
@@ -306,14 +307,19 @@ function decidePaidAndType({ cardName, attachmentCount }) {
     : { paid, type: 'post',          multiAllowed: false };
 }
 
-// ---------- AD CREATION ----------
-async function createSocialAd({ campaignId, card, paid, type }) {
+// ---------- AD CREATION (now sets ad-level message) ----------
+async function createSocialAd({ campaignId, card, paid, type, meta }) {
   const form = new FormData();
   form.append('name', card.name);
   form.append('network', FIXED_NETWORK);
   form.append('page_name', derivePageName(card.name));
-  form.append('paid', paid); // 'true' | 'false'
-  form.append('type', type); // 'post' | 'post-carousel' | 'story' | 'story-carousel'
+  form.append('paid', paid);                 // 'true' | 'false'
+  form.append('type', type);                 // 'post' | 'post-carousel' | 'story' | 'story-carousel'
+
+  // NEW: set the ad-level Primary Text (top message)
+  if (meta?.description) {
+    form.append('message', meta.description); // populates the top "Primary Text"
+  }
 
   console.log(`Creating social ad → campaign=${campaignId}, name="${card.name}", network=${FIXED_NETWORK}, paid=${paid}, type=${type}, page_name="${derivePageName(card.name)}"`);
   const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
@@ -391,15 +397,15 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   const campaignId = mapping.campaignId || mapping.projectId || DEFAULT_PROJECT_ID;
   if (!campaignId) throw new Error('No campaignId found (CSV "Adpiler Campaign ID" or DEFAULT_PROJECT_ID required)');
 
-  // 1) decide paid/type
+  // 1) decide paid/type + meta
   const meta = extractAdMetaFromCard(card);
   const { paid, type, multiAllowed } = decidePaidAndType({
     cardName: card.name,
     attachmentCount: attachments?.length || 0
   });
 
-  // 2) create ad
-  const { adId } = await createSocialAd({ campaignId, card, paid, type });
+  // 2) create ad (now includes ad-level message)
+  const { adId } = await createSocialAd({ campaignId, card, paid, type, meta });
 
   // 3) upload slides
   const uploaded = await uploadSlidesToAd({
@@ -449,3 +455,4 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
 
 module.exports = { uploadToAdpiler };
 module.exports.default = uploadToAdpiler;
+
