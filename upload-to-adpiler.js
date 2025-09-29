@@ -3,7 +3,7 @@
  * - Uses valid schema: { paid: 'true'|'false', type: 'post'|'post-carousel'|'story'|'story-carousel' }
  * - Chooses multi/single slide legality based on (paid, type) + attachment count
  * - Uploads ONE ad, then adds slides to that SAME ad (all slides when allowed)
- * - Constructs preview URL (with optional override if GET /campaigns/{id} fails)
+ * - Constructs preview URL (CSV code → ENV override → GET /campaigns/{id})
  * - Comments results back to Trello (filenames + preview link)
  */
 
@@ -25,7 +25,7 @@ const {
   DEFAULT_CLIENT_ID = '',
   DEFAULT_PROJECT_ID = '',
   ADPILER_PREVIEW_DOMAIN = 'preview.adpiler.com', // your whitelabel domain if any; default works
-  ADPILER_PAID_DEFAULT = 'true',                  // default behavior: create paid ads unless "organic" in title
+  ADPILER_PAID_DEFAULT = 'true',                  // default: create paid ads unless "organic" in title
   ADPILER_CAMPAIGN_CODE_OVERRIDE,                 // optional: bypass GET /campaigns/{id} if it 500s
 } = process.env;
 
@@ -50,11 +50,18 @@ async function getClientMapping(cardName) {
     clientId: String(DEFAULT_CLIENT_ID || '').trim(),
     campaignId: String(DEFAULT_PROJECT_ID || '').trim(),
     folderId: '',
+    campaignCode: '',
   };
 
   if (!CLIENT_CSV_URL) {
     if (fallback.clientId) {
-      return { clientId: fallback.clientId, projectId: fallback.campaignId, folderId: '', campaignId: fallback.campaignId };
+      return {
+        clientId: fallback.clientId,
+        projectId: fallback.campaignId,
+        folderId: '',
+        campaignId: fallback.campaignId,
+        campaignCode: fallback.campaignCode,
+      };
     }
     throw new Error('CLIENT_CSV_URL not set and no DEFAULT_CLIENT_ID provided');
   }
@@ -69,17 +76,27 @@ async function getClientMapping(cardName) {
   if (!row) row = rows.find(r => normalize(r['Trello Client Name']) === lcCard);
 
   if (row) {
-    const clientId   = String(row['Adpiler Client ID'] || '').trim();
-    const folderId   = String(row['Adpiler Folder ID'] || '').trim();
-    const campaignId = String(row['Adpiler Campaign ID'] || '').trim();
-    if (clientId && campaignId) return { clientId, projectId: campaignId, folderId, campaignId };
+    const clientId     = String(row['Adpiler Client ID'] || '').trim();
+    const folderId     = String(row['Adpiler Folder ID'] || '').trim();
+    const campaignId   = String(row['Adpiler Campaign ID'] || '').trim();
+    const campaignCode = String(row['Adpiler Campaign Code'] || '').trim(); // <-- optional CSV column
+
+    if (clientId && campaignId) {
+      return { clientId, projectId: campaignId, folderId, campaignId, campaignCode };
+    }
     console.warn(`CSV match for "${cardName}" missing required fields; falling back.`);
   } else {
     console.warn(`No CSV match for "${cardName}".`);
   }
 
   if (fallback.clientId && fallback.campaignId) {
-    return { clientId: fallback.clientId, projectId: fallback.campaignId, folderId: '', campaignId: fallback.campaignId };
+    return {
+      clientId: fallback.clientId,
+      projectId: fallback.campaignId,
+      folderId: '',
+      campaignId: fallback.campaignId,
+      campaignCode: fallback.campaignCode
+    };
   }
 
   throw new Error(`No valid client mapping found for card "${cardName}"`);
@@ -201,7 +218,9 @@ function buildPreviewUrl({ domain = ADPILER_PREVIEW_DOMAIN, campaignCode, adId }
   return adId ? `${base}?ad=${encodeURIComponent(adId)}` : base;
 }
 
-async function getCampaignCode(campaignId) {
+async function getCampaignCode(campaignId, mapping) {
+  // Priority: CSV code → ENV override → API
+  if (mapping?.campaignCode) return mapping.campaignCode;
   if (ADPILER_CAMPAIGN_CODE_OVERRIDE) return ADPILER_CAMPAIGN_CODE_OVERRIDE;
   const data = await getJSON(`campaigns/${encodeURIComponent(campaignId)}`);
   return data.code || data.data?.code || '';
@@ -215,7 +234,7 @@ function decidePaidAndType({ cardName, attachmentCount }) {
   const paidDefault = String(ADPILER_PAID_DEFAULT || 'true').toLowerCase() !== 'false';
   const paid = isOrganic ? 'false' : (paidDefault ? 'true' : 'false');
 
-  // Developer’s rules:
+  // From AdPiler developer:
   // ORGANIC (paid=false):
   //   - post -> one or more slides
   //   - story -> single slide
@@ -326,14 +345,15 @@ async function uploadSlidesToAd({ cardId, adId, attachments, meta, allowMultiple
 async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   assertEnv();
 
-  // 0) Resolve campaignId
-  let campaignId = DEFAULT_PROJECT_ID;
+  // 0) Resolve mapping and campaignId (use this mapping later for preview code)
+  let mapping;
   try {
-    const mapping = await getClientMapping(card.name);
-    campaignId = mapping.campaignId || mapping.projectId || DEFAULT_PROJECT_ID;
+    mapping = await getClientMapping(card.name);
   } catch (e) {
     console.warn(`Mapping lookup failed; using DEFAULT_PROJECT_ID. Reason: ${e.message}`);
+    mapping = { clientId: DEFAULT_CLIENT_ID, campaignId: DEFAULT_PROJECT_ID, projectId: DEFAULT_PROJECT_ID, folderId: '', campaignCode: '' };
   }
+  const campaignId = mapping.campaignId || mapping.projectId || DEFAULT_PROJECT_ID;
   if (!campaignId) throw new Error('No campaignId found (CSV "Adpiler Campaign ID" or DEFAULT_PROJECT_ID required)');
 
   // 1) Decide paid + type based on card + attachments
@@ -355,10 +375,10 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
     allowMultiple: !!multiAllowed
   });
 
-  // 4) Build preview URL (campaign code from API or override)
+  // 4) Build preview URL (CSV code → ENV override → API)
   let previewUrl = '';
   try {
-    const campaignCode = await getCampaignCode(campaignId);
+    const campaignCode = await getCampaignCode(campaignId, mapping);
     if (campaignCode) previewUrl = buildPreviewUrl({ campaignCode, adId });
   } catch (e) {
     console.warn('Preview URL build warning:', e.message);
