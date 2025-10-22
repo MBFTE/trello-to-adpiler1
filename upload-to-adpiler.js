@@ -1,3 +1,4 @@
+function normalizeCta(v){ return (v||'').toString().toUpperCase().replace(/\s+/g,'_'); }
 /**
  * Trello → AdPiler uploader (Facebook Social Ads)
  * - Valid schema: { paid: 'true'|'false', type: 'post'|'post-carousel'|'story'|'story-carousel' }
@@ -159,7 +160,7 @@ function extractAdMetaFromCard(card) {
   const primaryText = pick('Primary Text', 'Primary', 'Body', 'Post Text');
   const headline    = pick('Headline', 'Title');
   const cta         = pick('Call To Action', 'CTA');
-  const url         = pick('Landing Page URL', 'URL', 'Link', 'Landing Page');
+  const url         = pick('Click Through URL', 'Landing Page URL', 'URL', 'Link', 'Landing Page');
 
   // Description field (optional override). If empty, use Primary Text as API "description".
   let description = pick('Description');
@@ -331,7 +332,7 @@ async function createSocialAd({ campaignId, card, paid, type, meta }) {
 // ---------- SLIDES ----------
 async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
   const form = new FormData();
-  if (meta.cta)         form.append('call_to_action',   meta.cta);
+  if (meta.cta)         form.append('call_to_action', normalizeCta(meta.cta));
   if (meta.displayLink) form.append('display_link',     meta.displayLink);
   if (meta.headline)    form.append('headline',         meta.headline);
   if (meta.description) form.append('description',      meta.description);
@@ -399,6 +400,8 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
 
   // 1) decide paid/type + meta
   const meta = extractAdMetaFromCard(card);
+  if (!meta.displayLink && meta.url) { try { meta.displayLink = new URL(meta.url).hostname.replace(/^www\./,''); } catch(_) {} }
+  if (!meta.url && card && card.desc) { const m = card.desc.match(/Click Through URL:\s*(.+)/i); if (m) meta.url = m[1].trim(); }
   const { paid, type, multiAllowed } = decidePaidAndType({
     cardName: card.name,
     attachmentCount: attachments?.length || 0
@@ -455,4 +458,3 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
 
 module.exports = { uploadToAdpiler };
 module.exports.default = uploadToAdpiler;
-
