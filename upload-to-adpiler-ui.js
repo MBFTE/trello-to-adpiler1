@@ -132,14 +132,24 @@ async function downloadAttachmentToTemp(attachmentId, filenameHint = '') {
 function extractAdMetaFromCard(card) {
   const desc = card.desc || '';
   const grab = (label) => {
-    const m = desc.match(new RegExp(`${label}:\\s*(.+)`, 'i'));
+    const rx = new RegExp(`${label}:\s*(.+)`, 'i');
+    const m = desc.match(rx);
     return m ? m[1].trim() : '';
   };
+  const url = grab('Click Through URL') || grab('Landing Page URL') || grab('URL') || grab('Link');
+  const ctaRaw = grab('Call To Action') || grab('CTA');
+  let displayLink = '';
+  try { if (url) displayLink = new URL(url).hostname.replace(/^www\./,''); } catch {}
+  const primary = grab('Primary Text') || grab('Primary');
+  const shortDesc = grab('Description');
+  const combinedDesc = `${primary} ${shortDesc}`.trim();
+
   return {
     headline:    grab('Headline'),
-    description: grab('Description'),
-    cta:         grab('CTA'),
-    url:         grab('URL')
+    description: combinedDesc || shortDesc || primary,
+    cta:         (ctaRaw || '').toUpperCase().replace(/\s+/g, '_'),
+    url,
+    displayLink
   };
 }
 
