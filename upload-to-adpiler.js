@@ -1,9 +1,15 @@
 /**
- * Trello → AdPiler uploader (API mode)
- * - Single social (image/video) via POST /campaigns/{campaign}/ads   ← includes message + meta + file
- * - Carousel social via /social-ads + /slides
- * - Display 300×600 via POST /campaigns/{campaign}/ads              ← picks GIF else PNG, sets landing_page_url
- * - NEW: If a 1:1 (prefer 1200×1200) image is found, force a single social "post" (not carousel, not display)
+ * Trello → AdPiler uploader (Display, Post, Post Carousel)
+ *
+ * Modes:
+ *  - Display (300x600) → POST /campaigns/{campaign}/ads        (file + width/height + landing_page_url)
+ *  - Post (single social) → POST /campaigns/{campaign}/ads      (message + meta + file)
+ *  - Post Carousel → /social-ads (create) → /slides (upload)    (message on ad; meta on each slide)
+ *
+ * Auto mode selection (when ADPILER_FORCE_MODE not set):
+ *  1) If title hints "display" or a true 300x600 GIF/PNG exists → Display
+ *  2) Else if ≥2 square (1:1) images exist → Post Carousel
+ *  3) Else → Post (single)
  */
 
 const fetch = require('node-fetch');
@@ -11,9 +17,9 @@ const FormData = require('form-data');
 const csv = require('csvtojson');
 const { URL } = require('url');
 
-// Optional (dimension verification)
+// Optional (dimension verification for asset picking)
 let imageSize = null;
-try { imageSize = require('image-size'); } catch { /* optional dep */ }
+try { imageSize = require('image-size'); } catch { /* optional */ }
 
 // ---------- CONSTANTS ----------
 const FIXED_NETWORK = 'facebook';
@@ -31,7 +37,8 @@ const {
   ADPILER_PAID_DEFAULT = 'true',
   ADPILER_CAMPAIGN_CODE_OVERRIDE,
   ADPILER_API_BASE,
-  ADPILER_BASE_URL
+  ADPILER_BASE_URL,
+  ADPILER_FORCE_MODE // 'display' | 'post' | 'post-carousel'
 } = process.env;
 
 const _API_BASE = (ADPILER_API_BASE || ADPILER_BASE_URL || '').trim();
@@ -160,7 +167,7 @@ function extractAdMetaFromCard(card) {
   const headline    = pick('Headline', 'Title');
   const cta         = pick('Call To Action', 'CTA');
   const url         = pick('Landing Page URL', 'URL', 'Link', 'Landing Page');
-  let description   = pick('Description'); // keep separate; do NOT overwrite primary
+  let description   = pick('Description'); // do NOT overwrite primary
 
   const clean = (s) => (isBlank(s) ? '' : norm(s));
   const cleanedUrl = clean(url);
@@ -246,31 +253,68 @@ async function getCampaignCodeViaApi(campaignId) {
 }
 
 // ---------- DECIDE paid + type ----------
-function decidePaidAndType({ cardName, attachmentCount }) {
+function decidePaidAndType({ cardName }) {
   const lc = normalize(cardName);
-  const isStory = /\bstory\b/.test(lc);
   const isOrganic = /\borganic\b/.test(lc);
   const paidDefault = String(ADPILER_PAID_DEFAULT || 'true').toLowerCase() !== 'false';
   const paid = isOrganic ? false : !!paidDefault; // boolean
+  return { paid };
+}
 
-  if (!paid) { // organic
-    if (isStory) {
-      return attachmentCount > 1
-        ? { paid, type: 'story-carousel', multiAllowed: true }
-        : { paid, type: 'story',           multiAllowed: false };
-    }
-    return { paid, type: 'post', multiAllowed: attachmentCount > 1 };
-  }
+// ---------- Asset pickers ----------
+function _nameLooks300x600(name=''){const s=(name||'').toLowerCase();return /\b300x600\b/.test(s)||/\b300\D*600\b/.test(s);}
+function _isGifOrPng(name='',mime=''){const n=(name||'').toLowerCase();const m=(mime||'').toLowerCase();return n.endsWith('.gif')||n.endsWith('.png')||/image\/(gif|png)/.test(m);}
+function _isImageName(name=''){return /\.(png|jpe?g|gif|webp)$/i.test(String(name||''));}
 
-  // paid ads
-  if (isStory) {
-    return attachmentCount > 1
-      ? { paid, type: 'story-carousel', multiAllowed: true }
-      : { paid, type: 'story',           multiAllowed: false };
+async function collectSquareAssets(cardId, attachments = []) {
+  const out = [];
+  for (const att of attachments || []) {
+    if (!att?.id || !_isImageName(att.name||'')) continue;
+    try {
+      const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
+      let w=0,h=0, exact1200=false, hint=/\b(1\s*:\s*1|1200x1200|1080x1080|square)\b/i.test(filename||att.name||'');
+      if (imageSize) {
+        try { const d=imageSize(buffer); w=d?.width||0; h=d?.height||0; exact1200 = (w===1200 && h===1200); } catch {}
+      }
+      const isSquare = (w>0 && h>0 && w===h) || exact1200;
+      if (isSquare || hint) {
+        out.push({ buffer, filename: filename || att.name || `asset-${att.id}`, exact1200, isSquare, hint });
+      }
+    } catch (e) { console.warn('square pick skip:', e.message); }
   }
-  return attachmentCount > 1
-    ? { paid, type: 'post-carousel', multiAllowed: true }
-    : { paid, type: 'post',          multiAllowed: false };
+  out.sort((a,b)=>{
+    const A=[a.exact1200?1:0,a.isSquare?1:0,a.hint?1:0,(a.filename||'').toLowerCase()];
+    const B=[b.exact1200?1:0,b.isSquare?1:0,b.hint?1:0,(b.filename||'').toLowerCase()];
+    return (B[0]-A[0])||(B[1]-A[1])||(B[2]-A[2])||(A[3]<B[3]?-1:1);
+  });
+  return out;
+}
+
+async function pickFirstAttachment(cardId, attachments=[]) {
+  if (!attachments?.length) return null;
+  try { const { buffer, filename } = await downloadAttachmentBuffer(cardId, attachments[0]); return { buffer, filename }; }
+  catch (e) { console.warn('first attachment download failed:', e.message); return null; }
+}
+
+async function pickDisplay300x600(cardId, attachments = []) {
+  const cand=[];
+  for (const att of attachments||[]) {
+    if (!att?.id || !_isGifOrPng(att.name, att.mimeType)) continue;
+    try {
+      const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
+      let w=0,h=0;
+      if (imageSize) { try { const d=imageSize(buffer); w=d?.width||0; h=d?.height||0; } catch {} }
+      const okDim=(w===300&&h===600)||(w===600&&h===300);
+      cand.push({ buffer, filename: filename||att.name||`asset-${att.id}`, gif:/\.gif$/i.test(filename||att.name||''), hinted:_nameLooks300x600(filename||att.name), okDim });
+    } catch (e) { console.warn('display pick skip:', e.message); }
+  }
+  if (!cand.length) return null;
+  cand.sort((a,b)=>{
+    const A=[a.okDim?1:0,a.hinted?1:0,a.gif?1:0,(a.filename||'').toLowerCase()];
+    const B=[b.okDim?1:0,b.hinted?1:0,b.gif?1:0,(b.filename||'').toLowerCase()];
+    return (B[0]-A[0])||(B[1]-A[1])||(B[2]-A[2])||(A[3]<B[3]?-1:1);
+  });
+  return cand[0];
 }
 
 // ---------- /ads helpers (single social + display) ----------
@@ -288,13 +332,14 @@ async function postAdsCreate(campaignId, form) {
   return id;
 }
 
-async function createSocialSingleGraphicViaAds({ campaignId, card, meta, media, type='post', paid=true }) {
+// Single social post via /ads (message + meta + file)
+async function createSocialPostViaAds({ campaignId, card, meta, media, paid=true }) {
   const form = new FormData();
   form.append('name', card.name);
   form.append('network', FIXED_NETWORK);
   form.append('page_name', derivePageName(card.name));
   form.append('paid', paid ? 'true' : 'false');
-  form.append('type', 'post'); // ← force single post (not carousel, not story)
+  form.append('type', 'post'); // single post (not story, not carousel)
   if (meta?.primary)     form.append('message',         meta.primary);
   if (meta?.headline)    form.append('headline',        meta.headline);
   if (meta?.description) form.append('description',     meta.description);
@@ -303,60 +348,32 @@ async function createSocialSingleGraphicViaAds({ campaignId, card, meta, media, 
   if (meta?.displayLink) form.append('display_link',    meta.displayLink);
   form.append('file', media.buffer, { filename: media.filename });
   const id = await postAdsCreate(campaignId, form);
-  console.log(`✅ Social single /ads created ${id} (${media.filename})`);
+  console.log(`✅ Social POST (/ads) ${id} file=${media.filename}`);
   return id;
 }
 
-// DISPLAY picking utilities (kept for your 300×600 flow; won't be used for 1:1 social)
-function _looks300x600(name=''){const s=(name||'').toLowerCase();return /\b300x600\b/.test(s)||/\b300\D*600\b/.test(s);}
-function _isGifOrPng(name='',mime=''){const n=(name||'').toLowerCase();const m=(mime||'').toLowerCase();return n.endsWith('.gif')||n.endsWith('.png')||/image\/(gif|png)/.test(m);}
-async function selectDisplay300x600Asset(cardId, attachments=[]) {
-  const cand=[];
-  for (const att of attachments||[]) {
-    if (!att?.id || !_isGifOrPng(att.name, att.mimeType)) continue;
-    try {
-      const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
-      let w=0,h=0;
-      if (imageSize) { try { const d=imageSize(buffer); w=d?.width||0; h=d?.height||0; } catch {} }
-      const okDim=(w===300&&h===600)||(w===600&&h===300);
-      cand.push({ buffer, filename: filename||att.name||`asset-${att.id}`, isGif:/\.gif$/i.test(filename||att.name||''), hinted:_looks300x600(filename||att.name), okDim });
-    } catch(e){ console.warn('display pick skip:', e.message); }
-  }
-  if (!cand.length) return null;
-  cand.sort((a,b)=>{
-    const A=[a.okDim?1:0,a.hinted?1:0,a.isGif?1:0,(a.filename||'').toLowerCase()];
-    const B=[b.okDim?1:0,b.hinted?1:0,b.isGif?1:0,(b.filename||'').toLowerCase()];
-    return (B[0]-A[0])||(B[1]-A[1])||(B[2]-A[2])||(A[3]<B[3]?-1:1);
-  });
-  return cand[0];
-}
-function extractLandingPageUrlOnly(card){
-  const desc=card.desc||'';
-  const grab=(label)=>{ const m = desc.match(new RegExp('^\\s*[*_~`]*' + label + '[*_~`]*\\s*:\\s*(.+)$','im')); return m?m[1].trim():''; };
-  return (grab('Landing Page URL')||grab('URL')||grab('Link')||grab('Landing Page')||'').trim();
-}
+// Display 300x600 via /ads
 async function createDisplay300x600ViaAds({ campaignId, card, asset, landingUrl }) {
-  const form=new FormData();
+  const form = new FormData();
   form.append('name', card.name);
-  form.append('width','300');
+  form.append('width', '300');
   form.append('height','600');
   if (landingUrl) form.append('landing_page_url', landingUrl);
   form.append('file', asset.buffer, { filename: asset.filename });
   const id = await postAdsCreate(campaignId, form);
-  console.log(`✅ Display 300x600 /ads created ${id} (${asset.filename})`);
+  console.log(`✅ Display 300x600 (/ads) ${id} file=${asset.filename}`);
   return id;
 }
 
 // ---------- Carousel social via social-ads + slides ----------
-async function createSocialAdWithMessage({ campaignId, card, paid, type, primaryText }) {
+async function createSocialAdWithMessage({ campaignId, card, paid, primaryText }) {
   const form = new FormData();
   form.append('name', card.name);
   form.append('network', FIXED_NETWORK);
   form.append('page_name', derivePageName(card.name));
   form.append('paid', paid ? 'true' : 'false');
-  form.append('type', type);
+  form.append('type', 'post-carousel');
   if (primaryText) form.append('message', primaryText);
-  console.log(`Creating social (carousel-capable) → ${type}`);
   const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
   const adId = json.id || json.adId || json.data?.id;
   if (!adId) throw new Error(`Create social-ad did not return id. Keys: ${Object.keys(json)}`);
@@ -379,79 +396,29 @@ async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
   } catch {}
   form.append('media_file', fileBuf, { filename });
   const json = await postForm(`social-ads/${encodeURIComponent(adId)}/slides`, form);
-  console.log(`✅ Slide uploaded to ad ${adId}: ${filename}`);
+  console.log(`✅ Slide → ad ${adId}: ${filename}`);
   return { raw: json };
 }
 
-async function uploadSlidesToAd({ cardId, adId, attachments, meta, allowMultiple }) {
-  const uploaded = [];
-  const sorted = (attachments || []).slice().sort((a, b) =>
-    (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' })
-  );
+async function uploadSlidesToAd({ cardId, adId, attachments, meta, onlyThese }) {
+  const list = (onlyThese && onlyThese.length) ? onlyThese : (attachments || []);
+  const sorted = list.slice().sort((a, b) => (a.filename||a.name||'').localeCompare((b.filename||b.name||''), undefined, { numeric: true, sensitivity: 'base' }));
+
   let count = 0;
   for (const att of sorted) {
-    if (!att || !att.id) continue;
-    if (!allowMultiple && count >= 1) break;
     try {
-      const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
-      const res = await uploadOneSlide({ adId, fileBuf: buffer, filename: filename || `asset-${att.id}`, meta });
-      uploaded.push({ attachmentId: att.id, filename: filename || att.name, result: res.raw });
-      console.log(`📎 Added slide ${count + 1}: ${filename || att.name}`);
+      let buffer, filename;
+      if (att.buffer) { buffer = att.buffer; filename = att.filename; } // from square collector
+      else { const dl = await downloadAttachmentBuffer(cardId, att); buffer = dl.buffer; filename = dl.filename || att.name || `asset-${att.id}`; }
+      await uploadOneSlide({ adId, fileBuf: buffer, filename, meta });
       count++;
       await new Promise(r => setTimeout(r, 200));
     } catch (e) {
-      console.warn(`⚠️ Slide upload failed for ${att.id} (${att.name || ''}): ${e.message}`);
+      console.warn(`⚠️ Slide upload failed (${att.name || att.filename || ''}): ${e.message}`);
     }
   }
-  if (uploaded.length === 0 && (attachments?.length || 0) > 0) {
-    throw new Error('No attachments could be uploaded (need at least one uploaded file or public URL).');
-  }
-  return uploaded;
-}
-
-// ---------- 1:1 social asset picking (NEW) ----------
-function isLikelySquareName(name='') {
-  const s = String(name).toLowerCase();
-  return /\b1200x1200\b/.test(s) || /\b1\s*:\s*1\b/.test(s) || /\b1080x1080\b/.test(s) || /\bsquare\b/.test(s);
-}
-function isImageName(name='') {
-  const n = (name||'').toLowerCase();
-  return /\.(png|jpe?g|gif|webp)$/i.test(n);
-}
-async function pickOneToOneSocialAsset(cardId, attachments=[]) {
-  const candidates = [];
-  for (const att of attachments||[]) {
-    if (!att?.id || !isImageName(att.name||'')) continue;
-    try {
-      const { buffer, filename, mimeType } = await downloadAttachmentBuffer(cardId, att);
-      let w=0,h=0, exact1200=false, squareHint=isLikelySquareName(filename||att.name||'');
-      if (imageSize) {
-        try {
-          const d=imageSize(buffer);
-          w=d?.width||0; h=d?.height||0;
-          exact1200 = (w===1200 && h===1200);
-        } catch {}
-      }
-      const isSquare = exact1200 || (w>0 && h>0 && w===h);
-      candidates.push({
-        buffer, filename: filename||att.name||`asset-${att.id}`,
-        exact1200, isSquare, squareHint,
-        // simple preference for PNG/JPG over GIF for social stills:
-        isPreferredStill: /\.(png|jpe?g|jpg|webp)$/i.test(filename||'')
-      });
-    } catch (e) {
-      console.warn('1:1 pick skip:', e.message);
-    }
-  }
-  if (!candidates.length) return null;
-
-  // Sort: exact1200 desc → isSquare desc → squareHint desc → preferred still desc → name asc
-  candidates.sort((a,b)=>{
-    const A=[a.exact1200?1:0,a.isSquare?1:0,a.squareHint?1:0,a.isPreferredStill?1:0,(a.filename||'').toLowerCase()];
-    const B=[b.exact1200?1:0,b.isSquare?1:0,b.squareHint?1:0,b.isPreferredStill?1:0,(b.filename||'').toLowerCase()];
-    return (B[0]-A[0])||(B[1]-A[1])||(B[2]-A[2])||(B[3]-A[3])||(A[4]<B[4]?-1:1);
-  });
-  return candidates[0];
+  if (count === 0 && list.length > 0) throw new Error('No slides uploaded (check file accessibility).');
+  return count;
 }
 
 // ---------- MAIN ----------
@@ -465,70 +432,87 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   const campaignId = mapping.campaignId || mapping.projectId || DEFAULT_PROJECT_ID;
   if (!campaignId) throw new Error('No campaignId found (CSV "Adpiler Campaign ID" or DEFAULT_PROJECT_ID required)');
 
-  // 1) meta + choose social path
+  // 1) meta + paid
   const meta = extractAdMetaFromCard(card);
-  const { paid, type, multiAllowed } = decidePaidAndType({ cardName: card.name, attachmentCount: attachments?.length || 0 });
+  const { paid } = decidePaidAndType({ cardName: card.name });
 
+  // 2) decide mode (force or auto)
+  const title = String(card.name || '');
+  const wantsDisplayHint = /\bdisplay\b/i.test(title) || /\b300\D*600\b/i.test(title);
+  const forceMode = (ADPILER_FORCE_MODE || '').toLowerCase().trim(); // 'display' | 'post' | 'post-carousel'
+
+  let mode = forceMode || '';
   let socialAdId = '';
-  let uploadedSlides = [];
-
-  // NEW PRIORITY: if a 1:1 asset exists (prefer exact 1200×1200), do a single social "post" via /ads (even if multiple attachments are on the card)
-  let squareAsset = null;
-  try { squareAsset = await pickOneToOneSocialAsset(card.id, attachments); } catch {}
-
-  if (squareAsset) {
-    socialAdId = await createSocialSingleGraphicViaAds({
-      campaignId, card, meta, media: squareAsset, type: 'post', paid
-    });
-  } else if ((attachments?.length || 0) === 1 && (type === 'post' || type === 'story')) {
-    // Single social via /ads (fallback: only one asset present)
-    const media = await downloadAttachmentBuffer(card.id, attachments[0]); // {buffer, filename}
-    socialAdId = await createSocialSingleGraphicViaAds({
-      campaignId, card, meta, media, type: 'post', paid
-    });
-  } else {
-    // Carousel social via social-ads + slides
-    const { adId } = await createSocialAdWithMessage({ campaignId, card, paid, type, primaryText: meta.primary });
-    socialAdId = adId;
-    uploadedSlides = await uploadSlidesToAd({ cardId: card.id, adId: socialAdId, attachments, meta, allowMultiple: !!multiAllowed });
-  }
-
-  // 2) Display 300×600 (only when card/title/asset indicates display; do NOT create display when we selected 1:1 single social)
-  const wantsDisplay = !squareAsset && (/\bdisplay\b/i.test(card.name) || /\b300\D*600\b/i.test(card.name));
   let displayAdId = '';
-  let displayPicked = '';
+  let uploadedCount = 0;
+
   try {
-    if (wantsDisplay) {
-      const asset = await selectDisplay300x600Asset(card.id, attachments);
-      if (!asset) throw new Error('Requested display but no 300x600 GIF/PNG found');
-      displayPicked = asset.filename;
-      const lp = extractLandingPageUrlOnly(card) || meta.url || '';
-      displayAdId = await createDisplay300x600ViaAds({ campaignId, card, asset, landingUrl: lp });
+    // Pre-scan for assets we might need
+    const displayAsset = await pickDisplay300x600(card.id, attachments);
+    const squareAssets = await collectSquareAssets(card.id, attachments);
+    const firstAsset = await pickFirstAttachment(card.id, attachments);
+
+    if (!mode) {
+      if (wantsDisplayHint || displayAsset) mode = 'display';
+      else if (squareAssets.length >= 2)    mode = 'post-carousel';
+      else                                  mode = 'post';
+    }
+
+    console.log(`Mode decided: ${mode}`);
+
+    if (mode === 'display') {
+      if (!displayAsset) throw new Error('Display mode selected but no 300x600 GIF/PNG found.');
+      const lp = meta.url || '';
+      displayAdId = await createDisplay300x600ViaAds({ campaignId, card, asset: displayAsset, landingUrl: lp });
+
+    } else if (mode === 'post') {
+      // Prefer a single square (1200x1200/1:1) if available, else first attachment
+      const media = squareAssets[0] || firstAsset;
+      if (!media) throw new Error('Post mode selected but no usable attachment found.');
+      socialAdId = await createSocialPostViaAds({ campaignId, card, meta, media, paid });
+
+    } else if (mode === 'post-carousel') {
+      const { adId } = await createSocialAdWithMessage({ campaignId, card, paid, primaryText: meta.primary });
+      socialAdId = adId;
+      // If we have squareAssets, use them. Else, use all attachments.
+      uploadedCount = await uploadSlidesToAd({
+        cardId: card.id,
+        adId: socialAdId,
+        attachments,
+        meta,
+        onlyThese: squareAssets.length ? squareAssets : undefined
+      });
+
+    } else {
+      throw new Error(`Unknown mode "${mode}"`);
     }
   } catch (e) {
-    console.warn('DISPLAY /ads skipped:', e.message);
+    console.error('Uploader error:', e.message);
+    throw e;
   }
 
-  // 3) Preview URL for social ad
+  // 3) Preview URL (for social ad when available)
   let previewUrl = '';
   try {
-    let campaignCode = mapping.campaignCode || ADPILER_CAMPAIGN_CODE_OVERRIDE || '';
-    if (!campaignCode) campaignCode = await getCampaignCodeViaApi(campaignId);
-    if (campaignCode) previewUrl = buildPreviewUrl({ domain: ADPILER_PREVIEW_DOMAIN, campaignCode, adId: socialAdId });
+    if (socialAdId) {
+      let campaignCode = mapping.campaignCode || ADPILER_CAMPAIGN_CODE_OVERRIDE || '';
+      if (!campaignCode) campaignCode = await getCampaignCodeViaApi(campaignId);
+      if (campaignCode) previewUrl = buildPreviewUrl({ domain: ADPILER_PREVIEW_DOMAIN, campaignCode, adId: socialAdId });
+    }
   } catch (e) { console.warn('Preview URL build warning:', e.message); }
 
   // 4) Trello comment
   if (postTrelloComment) {
     const lines = [];
-    if (squareAsset) {
-      lines.push(`✅ Social single (/ads, 1:1) created → id: ${socialAdId}, paid: ${paid ? 'true':'false'}, type: post. (file: ${squareAsset.filename})`);
-    } else if ((attachments?.length || 0) === 1) {
-      lines.push(`✅ Social single (/ads) created → id: ${socialAdId}, paid: ${paid ? 'true':'false'}, type: post. (file from only attachment)`);
-    } else {
-      lines.push(`✅ Social carousel (social-ads) created → id: ${socialAdId}, paid: ${paid ? 'true':'false'}, type: ${type}.`);
-      lines.push(`   Uploaded ${uploadedSlides.length} slide(s) out of ${attachments?.length || 0}.`);
+    if (socialAdId && mode === 'post') {
+      lines.push(`✅ Social POST (/ads) id: ${socialAdId}, paid: ${paid ? 'true' : 'false'}.`);
     }
-    if (displayAdId)  lines.push(`✅ Display 300x600 (/ads) id: ${displayAdId}${displayPicked?` (file: ${displayPicked})`:''}.`);
+    if (socialAdId && mode === 'post-carousel') {
+      lines.push(`✅ Social POST CAROUSEL (social-ads) id: ${socialAdId}, slides uploaded: ${uploadedCount}.`);
+    }
+    if (displayAdId && mode === 'display') {
+      lines.push(`✅ DISPLAY 300x600 (/ads) id: ${displayAdId}.`);
+    }
     lines.push('—');
     if (meta.primary)  lines.push(`Primary Text: ${meta.primary.substring(0,120)}${meta.primary.length>120?'…':''}`);
     if (meta.headline) lines.push(`Headline: ${meta.headline}`);
@@ -538,8 +522,10 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
     try { await postTrelloComment(card.id, lines.join('\n')); } catch {}
   }
 
-  const out = { adId: socialAdId, previewUrls: previewUrl ? [previewUrl] : [] };
+  const out = { previewUrls: previewUrl ? [previewUrl] : [] };
+  if (socialAdId) out.adId = socialAdId;
   if (displayAdId) out.displayAdId = displayAdId;
+  out.mode = mode;
   return out;
 }
 
