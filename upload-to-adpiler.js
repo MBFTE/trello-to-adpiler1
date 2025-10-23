@@ -138,7 +138,11 @@ function extractAdMetaFromCard(card) {
       for (const it of metaChecklist.checkItems || []) {
         const txt = String(it.name || '');
         const mm = txt.match(/^\s*([^:]+)\s*:\s*(.+)$/);
-        if (mm) clVals[mm[1].toLowerCase().trim()] = mm[2].trim();
+        if (mm) {
+        const rawKey = mm[1].trim();
+        const key = rawKey.replace(/[*_`~]/g,'').replace(/\s+/g,' ').toLowerCase();
+        clVals[key] = mm[2].trim();
+      }
       }
     }
   } catch {}
