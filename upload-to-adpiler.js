@@ -2,17 +2,17 @@
  * Trello → AdPiler uploader (Display, Post, Post Carousel)
  *
  * Modes:
- *  - Display (300x600) → POST /campaigns/{campaign}/ads        (file + width/height + landing_page_url)
- *  - Post (single social) → POST /campaigns/{campaign}/ads      (message + meta + file)
- *  - Post Carousel → /social-ads (create) → /slides (upload)    (message on ad; meta on each slide)
+ *  - Display (300x600) → POST /campaigns/{campaign}/ads                  (file + width/height + landing_page_url)
+ *  - Post (single social) → POST /campaigns/{campaign}/social-ads        (create) → /social-ads/{ad}/slides (upload 1)
+ *  - Post Carousel →     → POST /campaigns/{campaign}/social-ads        (create) → /social-ads/{ad}/slides (upload many)
  *
- * Auto mode selection (when ADPILER_FORCE_MODE not set):
- *  1) If ≥2 square (1:1) assets (incl. 1080×1080, 1200×1200) → Post Carousel
+ * Auto mode selection (unless ADPILER_FORCE_MODE is set to display|post|post-carousel):
+ *  1) If ≥2 square (1:1) assets (e.g., 1080×1080, 1200×1200) → Post Carousel
  *  2) Else if exactly 1 square → Post (single)
  *  3) Else if title hints "display" or a true 300×600 GIF/PNG exists → Display
  *  4) Else → Post (single)
  *
- * Labels tolerated with markdown wrappers, e.g. **Primary Text**:
+ * Labels tolerate markdown wrappers (e.g., **Primary Text**:).
  */
 
 const fetch = require('node-fetch');
@@ -150,7 +150,7 @@ function extractAdMetaFromCard(card) {
     if (metaChecklist) {
       for (const it of metaChecklist.checkItems || []) {
         const txt = String(it.name || '');
-        const mm = txt.match(/^\s*([^:]+)\s*:\s*(.+)$/);
+               const mm = txt.match(/^\s*([^:]+)\s*:\s*(.+)$/);
         if (mm) {
           const key = String(mm[1]).replace(/[*_`~]/g,'').toLowerCase().trim().replace(/\s+/g,' ');
           clVals[key] = mm[2].trim();
@@ -319,7 +319,7 @@ async function pickDisplay300x600(cardId, attachments = []) {
   return cand[0];
 }
 
-// ---------- /ads helpers (single social + display) ----------
+// ---------- /ads helper (Display) ----------
 async function postAdsCreate(campaignId, form) {
   const resp = await fetch(API(`campaigns/${encodeURIComponent(campaignId)}/ads`), {
     method: 'POST',
@@ -331,26 +331,6 @@ async function postAdsCreate(campaignId, form) {
   if (!resp.ok) throw new Error(`POST /ads → ${resp.status}: ${text}`);
   const id = json.id || json.adId || json.data?.id;
   if (!id) throw new Error(`Create /ads returned no id. Keys: ${Object.keys(json)}`);
-  return id;
-}
-
-// Single social post via /ads (message + meta + file)
-async function createSocialPostViaAds({ campaignId, card, meta, media, paid=true }) {
-  const form = new FormData();
-  form.append('name', card.name);
-  form.append('network', FIXED_NETWORK);
-  form.append('page_name', derivePageName(card.name));
-  form.append('paid', paid ? 'true' : 'false');
-  form.append('type', 'post'); // single post
-  if (meta?.primary)     form.append('message',         meta.primary);
-  if (meta?.headline)    form.append('headline',        meta.headline);
-  if (meta?.description) form.append('description',     meta.description);
-  if (meta?.cta)         form.append('call_to_action',  meta.cta);
-  if (meta?.url)         form.append('landing_page_url',meta.url);
-  if (meta?.displayLink) form.append('display_link',    meta.displayLink);
-  form.append('file', media.buffer, { filename: media.filename });
-  const id = await postAdsCreate(campaignId, form);
-  console.log(`✅ Social POST (/ads) ${id} file=${media.filename}`);
   return id;
 }
 
@@ -367,15 +347,16 @@ async function createDisplay300x600ViaAds({ campaignId, card, asset, landingUrl 
   return id;
 }
 
-// ---------- Carousel social via social-ads + slides ----------
-async function createSocialAdWithMessage({ campaignId, card, paid, primaryText }) {
+// ---------- Social ads (single + carousel) via /social-ads ----------
+async function createSocialAd({ campaignId, card, paid, type, primaryText }) {
+  // type: 'post' | 'post-carousel' | 'story' | 'story-carousel'
   const form = new FormData();
   form.append('name', card.name);
   form.append('network', FIXED_NETWORK);
   form.append('page_name', derivePageName(card.name));
   form.append('paid', paid ? 'true' : 'false');
-  form.append('type', 'post-carousel');
-  if (primaryText) form.append('message', primaryText);
+  form.append('type', type);
+  if (primaryText) form.append('message', primaryText); // ad-level Primary Text
   const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
   const adId = json.id || json.adId || json.data?.id;
   if (!adId) throw new Error(`Create social-ad did not return id. Keys: ${Object.keys(json)}`);
@@ -410,9 +391,9 @@ async function uploadSlidesToAd({ cardId, adId, attachments, meta, onlyThese }) 
   for (const att of sorted) {
     try {
       let buffer, filename;
-      if (att.buffer) { buffer = att.buffer; filename = att.filename; } // from square collector
+      if (att.buffer) { buffer = att.buffer; filename = att.filename; } // prepared object
       else { const dl = await downloadAttachmentBuffer(cardId, att); buffer = dl.buffer; filename = dl.filename || att.name || `asset-${att.id}`; }
-      await uploadOneSlide({ adId: adId, fileBuf: buffer, filename, meta });
+      await uploadOneSlide({ adId, fileBuf: buffer, filename, meta });
       count++;
       await new Promise(r => setTimeout(r, 200));
     } catch (e) {
@@ -469,13 +450,23 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
       displayAdId = await createDisplay300x600ViaAds({ campaignId, card, asset: displayAsset, landingUrl: lp });
 
     } else if (mode === 'post') {
-      // Prefer single 1:1 if we found one (incl. 1080x1080/1200x1200); else first attachment
+      // Create Social Ad (type=post), then upload exactly one slide (prefer the 1:1 if present)
       const media = squareAssets[0] || firstAsset;
       if (!media) throw new Error('Post mode selected but no usable attachment found.');
-      socialAdId = await createSocialPostViaAds({ campaignId, card, meta, media, paid });
+
+      const { adId } = await createSocialAd({ campaignId, card, paid, type: 'post', primaryText: meta.primary });
+      socialAdId = adId;
+
+      await uploadSlidesToAd({
+        cardId: card.id,
+        adId: socialAdId,
+        attachments,
+        meta,
+        onlyThese: [media] // single slide only
+      });
 
     } else if (mode === 'post-carousel') {
-      const { adId } = await createSocialAdWithMessage({ campaignId, card, paid, primaryText: meta.primary });
+      const { adId } = await createSocialAd({ campaignId, card, paid, type: 'post-carousel', primaryText: meta.primary });
       socialAdId = adId;
 
       // If we have squareAssets, use them. Else, use all attachments.
@@ -509,7 +500,7 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   if (postTrelloComment) {
     const lines = [];
     if (socialAdId && mode === 'post') {
-      lines.push(`✅ Social POST (/ads) id: ${socialAdId}, paid: ${paid ? 'true' : 'false'}.`);
+      lines.push(`✅ Social POST (social-ads + 1 slide) id: ${socialAdId}, paid: ${paid ? 'true' : 'false'}.`);
     }
     if (socialAdId && mode === 'post-carousel') {
       lines.push(`✅ Social POST CAROUSEL (social-ads) id: ${socialAdId}, slides uploaded: ${uploadedCount}.`);
