@@ -243,6 +243,43 @@ async function getJSON(path) {
   return json;
 }
 
+
+// ---------- SOCIAL AD UPDATE HELPERS ----------
+async function updateSocialAdFields(adId, fields) {
+  const headersJSON = { 'Authorization': `Bearer ${ADPILER_API_KEY}`, 'Content-Type': 'application/json' };
+  const bodyJSON = JSON.stringify(fields || {});
+
+  // Try PATCH JSON
+  try {
+    const r1 = await fetch(API(`social-ads/${encodeURIComponent(adId)}`), { method: 'PATCH', headers: headersJSON, body: bodyJSON });
+    if (r1.ok) return await r1.json();
+  } catch (e) { console.warn('PATCH social-ad failed:', e.message); }
+
+  // Try PUT JSON
+  try {
+    const r2 = await fetch(API(`social-ads/${encodeURIComponent(adId)}`), { method: 'PUT', headers: headersJSON, body: bodyJSON });
+    if (r2.ok) return await r2.json();
+  } catch (e) { console.warn('PUT social-ad failed:', e.message); }
+
+  // Try POST form (some tenants accept multipart on update)
+  try {
+    const form = new FormData();
+    for (const [k,v] of Object.entries(fields || {})) {
+      if (v !== undefined && v !== null) form.append(k, String(v));
+    }
+    const r3 = await fetch(API(`social-ads/${encodeURIComponent(adId)}`), { method: 'POST', headers: { 'Authorization': `Bearer ${ADPILER_API_KEY}`, ...form.getHeaders() }, body: form });
+    if (r3.ok) return await r3.json();
+  } catch (e) { console.warn('POST (form) social-ad failed:', e.message); }
+
+  // Last resort: POST to an /update path if supported
+  try {
+    const r4 = await fetch(API(`social-ads/${encodeURIComponent(adId)}/update`), { method: 'POST', headers: headersJSON, body: bodyJSON });
+    if (r4.ok) return await r4.json();
+  } catch (e) { console.warn('POST /update social-ad failed:', e.message); }
+
+  console.warn('Unable to update social-ad fields via available methods.');
+  return null;
+}
 // ---------- PREVIEW URL HELPERS ----------
 function buildPreviewUrl({ domain = ADPILER_PREVIEW_DOMAIN, campaignCode, adId }) {
   const base = `https://${domain.replace(/^https?:\/\//, '')}/${encodeURIComponent(campaignCode)}`;
@@ -410,7 +447,19 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   // 2) create ad (now includes ad-level message)
   const { adId } = await createSocialAd({ campaignId, card, paid, type, meta });
 
-  // 3) upload slides
+  
+  // 2.5) Explicitly set the ad-level message (some tenants ignore it on create)
+  try {
+    const desiredMessage = meta?.primary || meta?.description || '';
+    if (desiredMessage) {
+      await updateSocialAdFields(adId, { message: desiredMessage });
+      console.log('🔧 Updated social-ad message field after creation.');
+    }
+  } catch (e) {
+    console.warn('Could not update social ad message:', e.message);
+  }
+
+// 3) upload slides
   const uploaded = await uploadSlidesToAd({
     cardId: card.id,
     adId,
