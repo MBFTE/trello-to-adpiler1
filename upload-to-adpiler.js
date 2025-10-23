@@ -1,10 +1,8 @@
 /**
- * Trello → AdPiler uploader (Facebook Social Ads)
- * - Valid schema: { paid: 'true'|'false', type: 'post'|'post-carousel'|'story'|'story-carousel' }
- * - Creates ONE ad then uploads slides to that same ad
- * - Pulls Primary Text / Headline / CTA / URL from card Description or a checklist named "Ad Meta"
- * - Sets ad-level "message" so the top text is no longer "Your message here"
- * - Preview URL: CSV code -> env override -> API fallback (+ probing)
+ * Trello → AdPiler uploader (API mode)
+ * Two-phase behavior:
+ *  - Phase 1 (create): send ONLY the ad-level Primary Text as `message`
+ *  - Phase 2 (slides): send per-slide meta (headline, description, CTA, URL, display_link)
  */
 
 const fetch = require('node-fetch');
@@ -27,9 +25,11 @@ const {
   ADPILER_PREVIEW_DOMAIN = 'preview.adpiler.com',
   ADPILER_PAID_DEFAULT = 'true',          // default to paid ads unless "organic" in title
   ADPILER_CAMPAIGN_CODE_OVERRIDE,         // optional manual campaign code
+  ADPILER_API_BASE,
+  ADPILER_BASE_URL
 } = process.env;
 
-const _API_BASE = (process.env.ADPILER_API_BASE || process.env.ADPILER_BASE_URL || '').trim();
+const _API_BASE = (ADPILER_API_BASE || ADPILER_BASE_URL || '').trim();
 
 function assertEnv() {
   const miss = [];
@@ -41,7 +41,7 @@ function assertEnv() {
   if (miss.length) throw new Error(`Missing env vars: ${miss.join(', ')}`);
 }
 
-const API = (p) => `${_API_BASE.replace(/\/+$/,'')}/${p.replace(/^\/+/, '')}`;
+const API = (p) => `${_API_BASE.replace(/\/+$/,'')}/${String(p || '').replace(/^\/+/, '')}`;
 const normalize = (s) => (s || '').toLowerCase().trim();
 
 // ---------- CSV CLIENT/CAMPAIGN LOOKUP ----------
@@ -63,7 +63,6 @@ async function getClientMapping(cardName) {
   const rows = await csv().fromString(await res.text());
 
   const lcCard = normalize(cardName);
-  // Try "contains" first to handle titles like "Client: Campaign - ..."
   let row = rows.find(r => lcCard.includes(normalize(r['Trello Client Name'])));
   if (!row) row = rows.find(r => normalize(r['Trello Client Name']) === lcCard);
 
@@ -71,8 +70,8 @@ async function getClientMapping(cardName) {
     const clientId     = String(row['Adpiler Client ID'] || '').trim();
     const folderId     = String(row['Adpiler Folder ID'] || '').trim();
     const campaignId   = String(row['Adpiler Campaign ID'] || '').trim();
-    const campaignCode = String(row['Adpiler Campaign Code'] || '').trim(); // optional column
-    if (clientId && campaignId) return { clientId, projectId: campaignId, folderId, campaignId, campaignCode };
+    const campaignCode = String(row['Adpiler Campaign Code'] || '').trim();
+    if (clientId && campaignId) return { clientId, folderId, campaignId, campaignCode };
     console.warn(`CSV match for "${cardName}" missing required fields; falling back to defaults.`);
   } else {
     console.warn(`No CSV match for "${cardName}".`);
@@ -120,15 +119,14 @@ function extractAdMetaFromCard(card) {
   const norm = (s) => (s || '').trim();
   const isBlank = (s) => !s || /^leave\s+blank$/i.test(String(s).trim());
 
-  // 1) parse from description
+  // 1) parse from description (allow markdown-wrapped labels, e.g. **Primary Text**:)
   const desc = card.desc || '';
   const grab = (label) => {
-    // match start-of-line "Label: value" (case-insensitive, multiline)
-    const m = desc.match(new RegExp(`^\\s*${label}\\s*:\\s*(.+)$`, 'im'));
+    const m = desc.match(new RegExp(`^\\s*[*_~\\\`]*${label}[*_~\\\`]*\\s*:\\s*(.+)$`, 'im'));
     return m ? m[1].trim() : '';
   };
 
-  // 2) parse from checklist named "Ad Meta" if present
+  // 2) parse from checklist named "Ad Meta" if present (strip markdown from keys)
   let clVals = {};
   try {
     const metaChecklist = (card.checklists || []).find(cl =>
@@ -139,15 +137,14 @@ function extractAdMetaFromCard(card) {
         const txt = String(it.name || '');
         const mm = txt.match(/^\s*([^:]+)\s*:\s*(.+)$/);
         if (mm) {
-        const rawKey = mm[1].trim();
-        const key = rawKey.replace(/[*_`~]/g,'').replace(/\s+/g,' ').toLowerCase();
-        clVals[key] = mm[2].trim();
-      }
+          const rawKey = mm[1].trim();
+          const key = rawKey.replace(/[*_`~]/g,'').replace(/\s+/g,' ').toLowerCase();
+          clVals[key] = mm[2].trim();
+        }
       }
     }
   } catch {}
 
-  // pick: prefer checklist → description
   const pick = (label, ...aliases) => {
     const keys = [label, ...aliases].map(k => k.toLowerCase());
     for (const k of keys) {
@@ -169,7 +166,6 @@ function extractAdMetaFromCard(card) {
   let description = pick('Description');
   if (!description) description = primaryText;
 
-  // Respect "LEAVE BLANK"
   const clean = (s) => (isBlank(s) ? '' : norm(s));
   const cleanedUrl = clean(url);
 
@@ -182,13 +178,13 @@ function extractAdMetaFromCard(card) {
   } catch {}
 
   return {
-  primary:     clean(primaryText),
-  headline:    clean(headline),
-  description: clean(description),
-  cta:         clean(cta),
-  url:         cleanedUrl,
-  displayLink
-};
+    primary:     clean(primaryText),
+    headline:    clean(headline),
+    description: clean(description),
+    cta:         clean(cta),
+    url:         cleanedUrl,
+    displayLink
+  };
 }
 
 function derivePageName(cardName) {
@@ -198,7 +194,6 @@ function derivePageName(cardName) {
 
 // ---------- HTTP HELPERS ----------
 async function postForm(path, form, maxAttempts = 4) {
-  // Retries ONLY on 5xx/network; never on 4xx
   let attempt = 0, lastErr;
   while (attempt < maxAttempts) {
     attempt++;
@@ -210,24 +205,20 @@ async function postForm(path, form, maxAttempts = 4) {
       });
       const text = await resp.text();
       let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
-
       if (resp.ok) return json;
-
       if (resp.status >= 500) {
         const delay = 400 * (2 ** (attempt - 1)) + Math.floor(Math.random() * 200);
         console.warn(`AdPiler ${resp.status} on ${path} (attempt ${attempt}/${maxAttempts}) → retrying in ${delay}ms`);
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
-
       const err = new Error(`AdPiler ${resp.status} on ${path}: ${text}`);
       err.status = resp.status;
       err.body = json;
       throw err;
-
     } catch (e) {
       if (e && typeof e.status === 'number' && e.status < 500) {
-        throw e; // 4xx: do not retry
+        throw e;
       }
       lastErr = e;
       if (attempt < maxAttempts) {
@@ -248,43 +239,6 @@ async function getJSON(path) {
   return json;
 }
 
-
-// ---------- SOCIAL AD UPDATE HELPERS ----------
-async function updateSocialAdFields(adId, fields) {
-  const headersJSON = { 'Authorization': `Bearer ${ADPILER_API_KEY}`, 'Content-Type': 'application/json' };
-  const bodyJSON = JSON.stringify(fields || {});
-
-  // Try PATCH JSON
-  try {
-    const r1 = await fetch(API(`social-ads/${encodeURIComponent(adId)}`), { method: 'PATCH', headers: headersJSON, body: bodyJSON });
-    if (r1.ok) return await r1.json();
-  } catch (e) { console.warn('PATCH social-ad failed:', e.message); }
-
-  // Try PUT JSON
-  try {
-    const r2 = await fetch(API(`social-ads/${encodeURIComponent(adId)}`), { method: 'PUT', headers: headersJSON, body: bodyJSON });
-    if (r2.ok) return await r2.json();
-  } catch (e) { console.warn('PUT social-ad failed:', e.message); }
-
-  // Try POST form (some tenants accept multipart on update)
-  try {
-    const form = new FormData();
-    for (const [k,v] of Object.entries(fields || {})) {
-      if (v !== undefined && v !== null) form.append(k, String(v));
-    }
-    const r3 = await fetch(API(`social-ads/${encodeURIComponent(adId)}`), { method: 'POST', headers: { 'Authorization': `Bearer ${ADPILER_API_KEY}`, ...form.getHeaders() }, body: form });
-    if (r3.ok) return await r3.json();
-  } catch (e) { console.warn('POST (form) social-ad failed:', e.message); }
-
-  // Last resort: POST to an /update path if supported
-  try {
-    const r4 = await fetch(API(`social-ads/${encodeURIComponent(adId)}/update`), { method: 'POST', headers: headersJSON, body: bodyJSON });
-    if (r4.ok) return await r4.json();
-  } catch (e) { console.warn('POST /update social-ad failed:', e.message); }
-
-  console.warn('Unable to update social-ad fields via available methods.');
-  return null;
-}
 // ---------- PREVIEW URL HELPERS ----------
 function buildPreviewUrl({ domain = ADPILER_PREVIEW_DOMAIN, campaignCode, adId }) {
   const base = `https://${domain.replace(/^https?:\/\//, '')}/${encodeURIComponent(campaignCode)}`;
@@ -295,37 +249,11 @@ async function getCampaignCodeViaApi(campaignId) {
   return data.code || data.data?.code || '';
 }
 
-// Optional: try multiple preview variants and pick a 2xx
-async function httpOkay(url) {
-  try {
-    const r = await fetch(url, { method: 'GET' });
-    return r.ok;
-  } catch { return false; }
-}
-async function resolvePreviewUrl({ domain, campaignCode, adId }) {
-  const base = `https://${domain.replace(/^https?:\/\//, '')}/${encodeURIComponent(campaignCode)}`;
-  const candidates = [
-    `${base}?ad=${encodeURIComponent(adId)}`,
-    base,
-  ];
-  if (!/preview\.adpiler\.com$/i.test(domain)) {
-    const defBase = `https://preview.adpiler.com/${encodeURIComponent(campaignCode)}`;
-    candidates.push(`${defBase}?ad=${encodeURIComponent(adId)}`, defBase);
-  }
-  for (let attempt = 0; attempt < 3; attempt++) {
-    for (const u of candidates) {
-      if (await httpOkay(u)) return u;
-    }
-    await new Promise(r => setTimeout(r, 800 * (attempt + 1)));
-  }
-  return `${base}?ad=${encodeURIComponent(adId)}`; // last resort
-}
-
 // ---------- DECIDE paid + type ----------
 function decidePaidAndType({ cardName, attachmentCount }) {
   const lc = normalize(cardName);
-  const isStory = /story/.test(lc);
-  const isOrganic = /organic/.test(lc);
+  const isStory = /\bstory\b/.test(lc);
+  const isOrganic = /\borganic\b/.test(lc);
   const paidDefault = String(ADPILER_PAID_DEFAULT || 'true').toLowerCase() !== 'false';
   const paid = isOrganic ? false : !!paidDefault;
 
@@ -348,22 +276,6 @@ function decidePaidAndType({ cardName, attachmentCount }) {
     ? { paid, type: 'post-carousel', multiAllowed: true }
     : { paid, type: 'post',          multiAllowed: false };
 }
-        : { paid, type: 'story',           multiAllowed: false };
-    }
-    return { paid, type: 'post', multiAllowed: attachmentCount > 1 };
-  }
-
-  // paid ads
-  if (isStory) {
-    return attachmentCount > 1
-      ? { paid, type: 'story-carousel', multiAllowed: true }
-      : { paid, type: 'story',           multiAllowed: false };
-  }
-  return attachmentCount > 1
-    ? { paid, type: 'post-carousel', multiAllowed: true }
-    : { paid, type: 'post',          multiAllowed: false };
-}
-
 
 // ---------- CREATE SOCIAL AD (Phase 1: set ad-level message only) ----------
 async function createSocialAdWithMessage({ campaignId, card, paid, type, primaryText }) {
@@ -381,30 +293,8 @@ async function createSocialAdWithMessage({ campaignId, card, paid, type, primary
   if (!adId) throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
   return { adId, raw: json };
 }
-// ---------- AD CREATION (now sets ad-level message) ----------
-async function createSocialAd({ campaignId, card, paid, type, meta }) {
-  const form = new FormData();
-  form.append('name', card.name);
-  form.append('network', FIXED_NETWORK);
-  form.append('page_name', derivePageName(card.name));
-  form.append('paid', paid);                 // 'true' | 'false'
-  form.append('type', type);                 // 'post' | 'post-carousel' | 'story' | 'story-carousel'
 
-  // Set the ad-level Primary Text (top message)
-  if (meta?.primary) {
-    form.append('message', meta.primary);
-  } else if (meta?.description) {
-    form.append('message', meta.description);
-  }
-
-  console.log(`Creating social ad → campaign=${campaignId}, name="${card.name}", network=${FIXED_NETWORK}, paid=${paid}, type=${type}, page_name="${derivePageName(card.name)}"`);
-  const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
-  const adId = json.id || json.adId || json.data?.id;
-  if (!adId) throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
-  return { adId, raw: json, paid, type };
-}
-
-// ---------- SLIDES ----------
+// ---------- SLIDES (Phase 2) ----------
 async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
   const form = new FormData();
   if (meta.cta)         form.append('call_to_action',   meta.cta);
@@ -470,7 +360,7 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
     console.warn(`Mapping lookup failed; using defaults. Reason: ${e.message}`);
     mapping = { clientId: DEFAULT_CLIENT_ID, campaignId: DEFAULT_PROJECT_ID, campaignCode: '' };
   }
-  const campaignId = mapping.campaignId || mapping.projectId || DEFAULT_PROJECT_ID;
+  const campaignId = mapping.campaignId || DEFAULT_PROJECT_ID;
   if (!campaignId) throw new Error('No campaignId found (CSV "Adpiler Campaign ID" or DEFAULT_PROJECT_ID required)');
 
   // 1) decide paid/type + meta
@@ -480,9 +370,10 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
     attachmentCount: attachments?.length || 0
   });
 
-  // 2) create ad (Phase 1: only Primary Text as ad-level message)
-const { adId } = await createSocialAdWithMessage({ campaignId, card, paid, type, primaryText: meta.primary });
-// 3) upload slides
+  // 2) create ad (Phase 1: only Primary Text as message)
+  const { adId } = await createSocialAdWithMessage({ campaignId, card, paid, type, primaryText: meta.primary });
+
+  // 3) upload slides (Phase 2: per-slide meta)
   const uploaded = await uploadSlidesToAd({
     cardId: card.id,
     adId,
@@ -491,20 +382,12 @@ const { adId } = await createSocialAdWithMessage({ campaignId, card, paid, type,
     allowMultiple: !!multiAllowed
   });
 
-  // 4) preview URL (CSV code → env override → API; then probe for a 2xx)
+  // 4) preview URL (CSV code → env override → API)
   let previewUrl = '';
   try {
     let campaignCode = mapping.campaignCode || ADPILER_CAMPAIGN_CODE_OVERRIDE || '';
     if (!campaignCode) campaignCode = await getCampaignCodeViaApi(campaignId);
-    if (campaignCode) {
-      previewUrl = await resolvePreviewUrl({
-        domain: ADPILER_PREVIEW_DOMAIN,
-        campaignCode,
-        adId
-      });
-    } else {
-      console.warn('Preview URL: no campaign code available (CSV/override/API all empty).');
-    }
+    if (campaignCode) previewUrl = buildPreviewUrl({ domain: ADPILER_PREVIEW_DOMAIN, campaignCode, adId });
   } catch (e) {
     console.warn('Preview URL build warning:', e.message);
   }
@@ -512,12 +395,11 @@ const { adId } = await createSocialAdWithMessage({ campaignId, card, paid, type,
   // 5) Trello comment
   if (postTrelloComment) {
     const lines = [];
-    lines.push(`Created AdPiler Social Ad (id: ${adId}, paid: ${paid}, type: ${type}).`);
+    lines.push(`Created AdPiler Social Ad (id: ${adId}, paid: ${paid ? 'true' : 'false'}, type: ${type}).`);
     lines.push(`Uploaded ${uploaded.length} slide(s) out of ${attachments?.length || 0}:`);
     for (const u of uploaded) lines.push(`• ${u.filename || u.attachmentId}`);
-    // include meta summary
     lines.push('—');
-    if (meta.primary) lines.push(`Primary Text: ${meta.primary.substring(0,120)}${meta.primary.length>120?'…':''}`);
+    if (meta.primary)     lines.push(`Primary Text: ${meta.primary.substring(0,120)}${meta.primary.length>120?'…':''}`);
     if (meta.headline)    lines.push(`Headline: ${meta.headline}`);
     if (meta.cta)         lines.push(`CTA: ${meta.cta}`);
     if (meta.url)         lines.push(`URL: ${meta.url}`);
@@ -529,4 +411,3 @@ const { adId } = await createSocialAdWithMessage({ campaignId, card, paid, type,
 }
 
 module.exports = { uploadToAdpiler };
-module.exports.default = uploadToAdpiler;
