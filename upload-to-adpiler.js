@@ -178,14 +178,12 @@ function extractAdMetaFromCard(card) {
   } catch {}
 
   return {
-  primary:     clean(primaryText),     // NEW: ad-level top text
-  headline:    clean(headline),
-  description: clean(description),     // slide “description”; falls back to primary if blank
-  cta:         clean(cta),
-  url:         cleanedUrl,
-  displayLink
-};
-
+    headline:    clean(headline),
+    description: clean(description),   // maps to AdPiler "message" (ad-level) and slide "description"
+    cta:         clean(cta),
+    url:         cleanedUrl,
+    displayLink
+  };
 }
 
 function derivePageName(cardName) {
@@ -318,10 +316,13 @@ async function createSocialAd({ campaignId, card, paid, type, meta }) {
   form.append('paid', paid);                 // 'true' | 'false'
   form.append('type', type);                 // 'post' | 'post-carousel' | 'story' | 'story-carousel'
 
-  // NEW: set the ad-level Primary Text (top message)
-  if (meta?.description) {
-    form.append('message', meta.description); // populates the top "Primary Text"
-  }
+  // Set the ad-level Primary Text (top message) = Primary Text
+if (meta?.primary) {
+  form.append('message', meta.primary);
+} else if (meta?.description) {
+  // fallback: if no Primary Text provided, use Description
+  form.append('message', meta.description);
+}
 
   console.log(`Creating social ad → campaign=${campaignId}, name="${card.name}", network=${FIXED_NETWORK}, paid=${paid}, type=${type}, page_name="${derivePageName(card.name)}"`);
   const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
