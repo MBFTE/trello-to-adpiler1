@@ -136,21 +136,14 @@ function extractAdMetaFromCard(card) {
     const m = desc.match(rx);
     return m ? m[1].trim() : '';
   };
-  const url = grab('Click Through URL') || grab('Landing Page URL') || grab('URL') || grab('Link');
-  const ctaRaw = grab('Call To Action') || grab('CTA');
+  const url = grab('Landing Page URL') || grab('Click Through URL') || grab('URL') || grab('Link') || grab('Landing Page');
   let displayLink = '';
   try { if (url) displayLink = new URL(url).hostname.replace(/^www\./,''); } catch {}
-  const primary = grab('Primary Text') || grab('Primary');
-  const shortDesc = grab('Description');
-  const combinedDesc = `${primary} ${shortDesc}`.trim();
-
-  return {
-    headline:    grab('Headline'),
-    description: combinedDesc || shortDesc || primary,
-    cta:         (ctaRaw || '').toUpperCase().replace(/\s+/g, '_'),
-    url,
-    displayLink
-  };
+  const primary     = grab('Primary Text') || grab('Primary') || grab('Post Text') || '';
+  const headline    = grab('Headline') || grab('Title') || '';
+  const description = grab('Description') || '';
+  const cta         = grab('Call To Action') || grab('CTA') || '';
+  return { primary, headline, description, cta, url, displayLink };
 }
 
 /* ------------------------------- UI utils ------------------------------ */
@@ -233,9 +226,13 @@ async function uploadToAdpilerUI(card, attachments, { postTrelloComment } = {}) 
     };
 
     await logStep('Filling metadata fields');
+// Set ad-level Message (top text)
+await setIfExists(['textarea[name="message"]','input[name="message"]','textarea[placeholder*="Message"]','[name="ad[message]"]'], meta.primary);
+try { const [lbl] = await page.$x("//label[contains(normalize-space(.), 'Message')]"); if (lbl) { const forAttrHandle = await lbl.getProperty('htmlFor'); const forAttr = forAttrHandle ? await forAttrHandle.jsonValue() : null; if (forAttr) { const sel = `#${forAttr}`; const el = await page.$(sel); if (el) { await el.click({ clickCount: 3 }).catch(()=>{}); await page.type(sel, meta.primary, {delay:5}); } } } } catch(_){ }
     await setIfExists(['input[name="headline"]','input[name="title"]','input[placeholder*="Headline"]'], meta.headline);
     await setIfExists(['textarea[name="description"]','textarea[placeholder*="Description"]'], meta.description);
     await setIfExists(['input[name="cta"]','input[placeholder*="CTA"]'], meta.cta);
+try { const [lblCTA] = await page.$x("//label[contains(normalize-space(.), 'Call To Action')]"); if (lblCTA) { const forAttrHandle = await lblCTA.getProperty('htmlFor'); const forAttr = forAttrHandle ? await forAttrHandle.jsonValue() : null; if (forAttr) { const sel = `#${forAttr}`; const el = await page.$(sel); if (el) { await el.click({ clickCount: 3 }).catch(()=>{}); await page.type(sel, meta.cta, {delay:5}); } } } } catch(_){ }
     await setIfExists(['input[name="url"]','input[name="click_url"]','input[placeholder*="URL"]'], meta.url);
 
     /* 6) Submit */
