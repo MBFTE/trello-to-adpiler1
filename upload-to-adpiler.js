@@ -178,12 +178,13 @@ function extractAdMetaFromCard(card) {
   } catch {}
 
   return {
-    headline:    clean(headline),
-    description: clean(description),   // maps to AdPiler "message" (ad-level) and slide "description"
-    cta:         clean(cta),
-    url:         cleanedUrl,
-    displayLink
-  };
+  primary:     clean(primaryText),
+  headline:    clean(headline),
+  description: clean(description),
+  cta:         clean(cta),
+  url:         cleanedUrl,
+  displayLink
+};
 }
 
 function derivePageName(cardName) {
@@ -319,12 +320,12 @@ async function resolvePreviewUrl({ domain, campaignCode, adId }) {
 // ---------- DECIDE paid + type ----------
 function decidePaidAndType({ cardName, attachmentCount }) {
   const lc = normalize(cardName);
-  const isStory = /\bstory\b/.test(lc);
-  const isOrganic = /\borganic\b/.test(lc);
+  const isStory = /story/.test(lc);
+  const isOrganic = /organic/.test(lc);
   const paidDefault = String(ADPILER_PAID_DEFAULT || 'true').toLowerCase() !== 'false';
-  const paid = isOrganic ? 'false' : (paidDefault ? 'true' : 'false');
+  const paid = isOrganic ? false : !!paidDefault;
 
-  if (paid === 'false') { // organic
+  if (!paid) { // organic
     if (isStory) {
       return attachmentCount > 1
         ? { paid, type: 'story-carousel', multiAllowed: true }
@@ -343,7 +344,39 @@ function decidePaidAndType({ cardName, attachmentCount }) {
     ? { paid, type: 'post-carousel', multiAllowed: true }
     : { paid, type: 'post',          multiAllowed: false };
 }
+        : { paid, type: 'story',           multiAllowed: false };
+    }
+    return { paid, type: 'post', multiAllowed: attachmentCount > 1 };
+  }
 
+  // paid ads
+  if (isStory) {
+    return attachmentCount > 1
+      ? { paid, type: 'story-carousel', multiAllowed: true }
+      : { paid, type: 'story',           multiAllowed: false };
+  }
+  return attachmentCount > 1
+    ? { paid, type: 'post-carousel', multiAllowed: true }
+    : { paid, type: 'post',          multiAllowed: false };
+}
+
+
+// ---------- CREATE SOCIAL AD (Phase 1: set ad-level message only) ----------
+async function createSocialAdWithMessage({ campaignId, card, paid, type, primaryText }) {
+  const form = new FormData();
+  form.append('name', card.name);
+  form.append('network', FIXED_NETWORK);
+  form.append('page_name', derivePageName(card.name));
+  form.append('paid', paid ? 'true' : 'false');        // API accepts 'true'/'false' strings
+  form.append('type', type);
+  if (primaryText) form.append('message', primaryText); // ONLY Primary Text here
+
+  console.log(`Creating social ad (phase 1) → message set from Primary Text`);
+  const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
+  const adId = json.id || json.adId || json.data?.id;
+  if (!adId) throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
+  return { adId, raw: json };
+}
 // ---------- AD CREATION (now sets ad-level message) ----------
 async function createSocialAd({ campaignId, card, paid, type, meta }) {
   const form = new FormData();
@@ -353,13 +386,12 @@ async function createSocialAd({ campaignId, card, paid, type, meta }) {
   form.append('paid', paid);                 // 'true' | 'false'
   form.append('type', type);                 // 'post' | 'post-carousel' | 'story' | 'story-carousel'
 
-  // Set the ad-level Primary Text (top message) = Primary Text
-if (meta?.primary) {
-  form.append('message', meta.primary);
-} else if (meta?.description) {
-  // fallback: if no Primary Text provided, use Description
-  form.append('message', meta.description);
-}
+  // Set the ad-level Primary Text (top message)
+  if (meta?.primary) {
+    form.append('message', meta.primary);
+  } else if (meta?.description) {
+    form.append('message', meta.description);
+  }
 
   console.log(`Creating social ad → campaign=${campaignId}, name="${card.name}", network=${FIXED_NETWORK}, paid=${paid}, type=${type}, page_name="${derivePageName(card.name)}"`);
   const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
@@ -444,21 +476,8 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
     attachmentCount: attachments?.length || 0
   });
 
-  // 2) create ad (now includes ad-level message)
-  const { adId } = await createSocialAd({ campaignId, card, paid, type, meta });
-
-  
-  // 2.5) Explicitly set the ad-level message (some tenants ignore it on create)
-  try {
-    const desiredMessage = meta?.primary || meta?.description || '';
-    if (desiredMessage) {
-      await updateSocialAdFields(adId, { message: desiredMessage });
-      console.log('🔧 Updated social-ad message field after creation.');
-    }
-  } catch (e) {
-    console.warn('Could not update social ad message:', e.message);
-  }
-
+  // 2) create ad (Phase 1: only Primary Text as ad-level message)
+const { adId } = await createSocialAdWithMessage({ campaignId, card, paid, type, primaryText: meta.primary });
 // 3) upload slides
   const uploaded = await uploadSlidesToAd({
     cardId: card.id,
@@ -494,7 +513,7 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
     for (const u of uploaded) lines.push(`• ${u.filename || u.attachmentId}`);
     // include meta summary
     lines.push('—');
-    if (meta.description) lines.push(`Primary Text: ${meta.description.substring(0,120)}${meta.description.length>120?'…':''}`);
+    if (meta.primary) lines.push(`Primary Text: ${meta.primary.substring(0,120)}${meta.primary.length>120?'…':''}`);
     if (meta.headline)    lines.push(`Headline: ${meta.headline}`);
     if (meta.cta)         lines.push(`CTA: ${meta.cta}`);
     if (meta.url)         lines.push(`URL: ${meta.url}`);
