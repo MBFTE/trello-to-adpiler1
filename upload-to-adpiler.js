@@ -178,12 +178,14 @@ function extractAdMetaFromCard(card) {
   } catch {}
 
   return {
-    headline:    clean(headline),
-    description: clean(description),   // maps to AdPiler "message" (ad-level) and slide "description"
-    cta:         clean(cta),
-    url:         cleanedUrl,
-    displayLink
-  };
+  primary:     clean(primaryText),     // NEW: ad-level top text
+  headline:    clean(headline),
+  description: clean(description),     // slide “description”; falls back to primary if blank
+  cta:         clean(cta),
+  url:         cleanedUrl,
+  displayLink
+};
+
 }
 
 function derivePageName(cardName) {
