@@ -1,14 +1,18 @@
 /**
  * Trello → AdPiler uploader (API mode)
- * Two-phase behavior:
- *  - Phase 1 (create): send ONLY the ad-level Primary Text as `message`
- *  - Phase 2 (slides): send per-slide meta (headline, description, CTA, URL, display_link)
+ * - Single social (image/video) via POST /campaigns/{campaign}/ads   ← includes message + meta + file
+ * - Carousel social via /social-ads + /slides
+ * - Display 300×600 via POST /campaigns/{campaign}/ads              ← picks GIF else PNG, sets landing_page_url
  */
 
 const fetch = require('node-fetch');
 const FormData = require('form-data');
 const csv = require('csvtojson');
 const { URL } = require('url');
+
+// Optional (dimension verification for display assets)
+let imageSize = null;
+try { imageSize = require('image-size'); } catch { /* optional dep */ }
 
 // ---------- CONSTANTS ----------
 const FIXED_NETWORK = 'facebook';
@@ -23,8 +27,8 @@ const {
   DEFAULT_CLIENT_ID = '',
   DEFAULT_PROJECT_ID = '',
   ADPILER_PREVIEW_DOMAIN = 'preview.adpiler.com',
-  ADPILER_PAID_DEFAULT = 'true',          // default to paid ads unless "organic" in title
-  ADPILER_CAMPAIGN_CODE_OVERRIDE,         // optional manual campaign code
+  ADPILER_PAID_DEFAULT = 'true',
+  ADPILER_CAMPAIGN_CODE_OVERRIDE,
   ADPILER_API_BASE,
   ADPILER_BASE_URL
 } = process.env;
@@ -119,14 +123,14 @@ function extractAdMetaFromCard(card) {
   const norm = (s) => (s || '').trim();
   const isBlank = (s) => !s || /^leave\s+blank$/i.test(String(s).trim());
 
-  // 1) parse from description (allow markdown-wrapped labels, e.g. **Primary Text**:)
   const desc = card.desc || '';
   const grab = (label) => {
-    const m = desc.match(new RegExp(`^\\s*[*_~\\\`]*${label}[*_~\\\`]*\\s*:\\s*(.+)$`, 'im'));
+    // allow markdown wrappers: **Label**: value
+    const rx = new RegExp('^\\s*[*_~`]*' + label + '[*_~`]*\\s*:\\s*(.+)$', 'im');
+    const m = desc.match(rx);
     return m ? m[1].trim() : '';
   };
 
-  // 2) parse from checklist named "Ad Meta" if present (strip markdown from keys)
   let clVals = {};
   try {
     const metaChecklist = (card.checklists || []).find(cl =>
@@ -137,8 +141,7 @@ function extractAdMetaFromCard(card) {
         const txt = String(it.name || '');
         const mm = txt.match(/^\s*([^:]+)\s*:\s*(.+)$/);
         if (mm) {
-          const rawKey = mm[1].trim();
-          const key = rawKey.replace(/[*_`~]/g,'').replace(/\s+/g,' ').toLowerCase();
+          const key = String(mm[1]).replace(/[*_`~]/g,'').toLowerCase().trim().replace(/\s+/g,' ');
           clVals[key] = mm[2].trim();
         }
       }
@@ -147,13 +150,8 @@ function extractAdMetaFromCard(card) {
 
   const pick = (label, ...aliases) => {
     const keys = [label, ...aliases].map(k => k.toLowerCase());
-    for (const k of keys) {
-      if (clVals[k]) return clVals[k];
-    }
-    for (const k of [label, ...aliases]) {
-      const v = grab(k);
-      if (v) return v;
-    }
+    for (const k of keys) if (clVals[k]) return clVals[k];
+    for (const k of [label, ...aliases]) { const v = grab(k); if (v) return v; }
     return '';
   };
 
@@ -161,10 +159,7 @@ function extractAdMetaFromCard(card) {
   const headline    = pick('Headline', 'Title');
   const cta         = pick('Call To Action', 'CTA');
   const url         = pick('Landing Page URL', 'URL', 'Link', 'Landing Page');
-
-  // Description field (optional override). If empty, use Primary Text as API "description".
-  let description = pick('Description');
-  if (!description) description = primaryText;
+  let description   = pick('Description'); // keep separate; do NOT overwrite primary
 
   const clean = (s) => (isBlank(s) ? '' : norm(s));
   const cleanedUrl = clean(url);
@@ -206,6 +201,7 @@ async function postForm(path, form, maxAttempts = 4) {
       const text = await resp.text();
       let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
       if (resp.ok) return json;
+
       if (resp.status >= 500) {
         const delay = 400 * (2 ** (attempt - 1)) + Math.floor(Math.random() * 200);
         console.warn(`AdPiler ${resp.status} on ${path} (attempt ${attempt}/${maxAttempts}) → retrying in ${delay}ms`);
@@ -216,10 +212,9 @@ async function postForm(path, form, maxAttempts = 4) {
       err.status = resp.status;
       err.body = json;
       throw err;
+
     } catch (e) {
-      if (e && typeof e.status === 'number' && e.status < 500) {
-        throw e;
-      }
+      if (e && typeof e.status === 'number' && e.status < 500) throw e;
       lastErr = e;
       if (attempt < maxAttempts) {
         const delay = 400 * (2 ** (attempt - 1)) + Math.floor(Math.random() * 200);
@@ -255,7 +250,7 @@ function decidePaidAndType({ cardName, attachmentCount }) {
   const isStory = /\bstory\b/.test(lc);
   const isOrganic = /\borganic\b/.test(lc);
   const paidDefault = String(ADPILER_PAID_DEFAULT || 'true').toLowerCase() !== 'false';
-  const paid = isOrganic ? false : !!paidDefault;
+  const paid = isOrganic ? false : !!paidDefault; // boolean
 
   if (!paid) { // organic
     if (isStory) {
@@ -277,31 +272,104 @@ function decidePaidAndType({ cardName, attachmentCount }) {
     : { paid, type: 'post',          multiAllowed: false };
 }
 
-// ---------- CREATE SOCIAL AD (Phase 1: set ad-level message only) ----------
+// ---------- /ads helpers (single social + display) ----------
+async function postAdsCreate(campaignId, form) {
+  const resp = await fetch(API(`campaigns/${encodeURIComponent(campaignId)}/ads`), {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${ADPILER_API_KEY}`, ...form.getHeaders() },
+    body: form
+  });
+  const text = await resp.text();
+  let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!resp.ok) throw new Error(`POST /ads → ${resp.status}: ${text}`);
+  const id = json.id || json.adId || json.data?.id;
+  if (!id) throw new Error(`Create /ads returned no id. Keys: ${Object.keys(json)}`);
+  return id;
+}
+
+async function createSocialSingleGraphicViaAds({ campaignId, card, meta, media, type='post', paid=true }) {
+  const form = new FormData();
+  form.append('name', card.name);
+  form.append('network', FIXED_NETWORK);
+  form.append('page_name', derivePageName(card.name));
+  form.append('paid', paid ? 'true' : 'false');
+  form.append('type', (type === 'story') ? 'story' : 'post'); // single social types
+  if (meta?.primary)     form.append('message',         meta.primary);
+  if (meta?.headline)    form.append('headline',        meta.headline);
+  if (meta?.description) form.append('description',     meta.description);
+  if (meta?.cta)         form.append('call_to_action',  meta.cta);
+  if (meta?.url)         form.append('landing_page_url',meta.url);
+  if (meta?.displayLink) form.append('display_link',    meta.displayLink);
+  form.append('file', media.buffer, { filename: media.filename });
+  const id = await postAdsCreate(campaignId, form);
+  console.log(`✅ Social single /ads created ${id} (${media.filename})`);
+  return id;
+}
+
+function _looks300x600(name=''){const s=(name||'').toLowerCase();return /\b300x600\b/.test(s)||/\b300\D*600\b/.test(s);}
+function _isGifOrPng(name='',mime=''){const n=(name||'').toLowerCase();const m=(mime||'').toLowerCase();return n.endsWith('.gif')||n.endsWith('.png')||/image\/(gif|png)/.test(m);}
+
+async function selectDisplay300x600Asset(cardId, attachments=[]) {
+  const cand=[];
+  for (const att of attachments||[]) {
+    if (!att?.id || !_isGifOrPng(att.name, att.mimeType)) continue;
+    try {
+      const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
+      let w=0,h=0;
+      if (imageSize) { try { const d=imageSize(buffer); w=d?.width||0; h=d?.height||0; } catch {} }
+      const okDim=(w===300&&h===600)||(w===600&&h===300);
+      cand.push({ buffer, filename: filename||att.name||`asset-${att.id}`, isGif:/\.gif$/i.test(filename||att.name||''), hinted:_looks300x600(filename||att.name), okDim });
+    } catch(e){ console.warn('display pick skip:', e.message); }
+  }
+  if (!cand.length) return null;
+  cand.sort((a,b)=>{
+    const A=[a.okDim?1:0,a.hinted?1:0,a.isGif?1:0,(a.filename||'').toLowerCase()];
+    const B=[b.okDim?1:0,b.hinted?1:0,b.isGif?1:0,(b.filename||'').toLowerCase()];
+    return (B[0]-A[0])||(B[1]-A[1])||(B[2]-A[2])||(A[3]<B[3]?-1:1);
+  });
+  return cand[0];
+}
+
+function extractLandingPageUrlOnly(card){
+  const desc=card.desc||'';
+  const grab=(label)=>{ const m = desc.match(new RegExp('^\\s*[*_~`]*' + label + '[*_~`]*\\s*:\\s*(.+)$','im')); return m?m[1].trim():''; };
+  return (grab('Landing Page URL')||grab('URL')||grab('Link')||grab('Landing Page')||'').trim();
+}
+
+async function createDisplay300x600ViaAds({ campaignId, card, asset, landingUrl }) {
+  const form=new FormData();
+  form.append('name', card.name);
+  form.append('width','300');
+  form.append('height','600');
+  if (landingUrl) form.append('landing_page_url', landingUrl);
+  form.append('file', asset.buffer, { filename: asset.filename });
+  const id = await postAdsCreate(campaignId, form);
+  console.log(`✅ Display 300x600 /ads created ${id} (${asset.filename})`);
+  return id;
+}
+
+// ---------- Carousel social via social-ads + slides ----------
 async function createSocialAdWithMessage({ campaignId, card, paid, type, primaryText }) {
   const form = new FormData();
   form.append('name', card.name);
   form.append('network', FIXED_NETWORK);
   form.append('page_name', derivePageName(card.name));
-  form.append('paid', paid ? 'true' : 'false');        // API accepts 'true'/'false' strings
+  form.append('paid', paid ? 'true' : 'false');
   form.append('type', type);
-  if (primaryText) form.append('message', primaryText); // ONLY Primary Text here
-
-  console.log(`Creating social ad (phase 1) → message set from Primary Text`);
+  if (primaryText) form.append('message', primaryText);
+  console.log(`Creating social (carousel-capable) → ${type}`);
   const json = await postForm(`campaigns/${encodeURIComponent(campaignId)}/social-ads`, form);
   const adId = json.id || json.adId || json.data?.id;
-  if (!adId) throw new Error(`Create social-ad did not return an ad id. Response keys: ${Object.keys(json)}`);
+  if (!adId) throw new Error(`Create social-ad did not return id. Keys: ${Object.keys(json)}`);
   return { adId, raw: json };
 }
 
-// ---------- SLIDES (Phase 2) ----------
 async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
   const form = new FormData();
   if (meta.cta)         form.append('call_to_action',   meta.cta);
   if (meta.displayLink) form.append('display_link',     meta.displayLink);
   if (meta.headline)    form.append('headline',         meta.headline);
   if (meta.description) form.append('description',      meta.description);
-
   try {
     if (meta.url) {
       const u = new URL(meta.url);
@@ -310,9 +378,7 @@ async function uploadOneSlide({ adId, fileBuf, filename, meta }) {
       }
     }
   } catch {}
-
   form.append('media_file', fileBuf, { filename });
-
   const json = await postForm(`social-ads/${encodeURIComponent(adId)}/slides`, form);
   console.log(`✅ Slide uploaded to ad ${adId}: ${filename}`);
   return { raw: json };
@@ -323,12 +389,10 @@ async function uploadSlidesToAd({ cardId, adId, attachments, meta, allowMultiple
   const sorted = (attachments || []).slice().sort((a, b) =>
     (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' })
   );
-
   let count = 0;
   for (const att of sorted) {
     if (!att || !att.id) continue;
     if (!allowMultiple && count >= 1) break;
-
     try {
       const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
       const res = await uploadOneSlide({ adId, fileBuf: buffer, filename: filename || `asset-${att.id}`, meta });
@@ -340,11 +404,9 @@ async function uploadSlidesToAd({ cardId, adId, attachments, meta, allowMultiple
       console.warn(`⚠️ Slide upload failed for ${att.id} (${att.name || ''}): ${e.message}`);
     }
   }
-
   if (uploaded.length === 0 && (attachments?.length || 0) > 0) {
-    throw new Error('No attachments could be uploaded (ensure at least one is an uploaded Trello file or a public URL).');
+    throw new Error('No attachments could be uploaded (need at least one uploaded file or public URL).');
   }
-
   return uploaded;
 }
 
@@ -354,60 +416,74 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
 
   // 0) mapping/campaign
   let mapping;
-  try {
-    mapping = await getClientMapping(card.name);
-  } catch (e) {
-    console.warn(`Mapping lookup failed; using defaults. Reason: ${e.message}`);
-    mapping = { clientId: DEFAULT_CLIENT_ID, campaignId: DEFAULT_PROJECT_ID, campaignCode: '' };
-  }
-  const campaignId = mapping.campaignId || DEFAULT_PROJECT_ID;
+  try { mapping = await getClientMapping(card.name); }
+  catch (e) { console.warn(`Mapping lookup failed; using defaults. ${e.message}`); mapping = { clientId: DEFAULT_CLIENT_ID, campaignId: DEFAULT_PROJECT_ID, campaignCode: '' }; }
+  const campaignId = mapping.campaignId || mapping.projectId || DEFAULT_PROJECT_ID;
   if (!campaignId) throw new Error('No campaignId found (CSV "Adpiler Campaign ID" or DEFAULT_PROJECT_ID required)');
 
-  // 1) decide paid/type + meta
+  // 1) meta + choose social path
   const meta = extractAdMetaFromCard(card);
-  const { paid, type, multiAllowed } = decidePaidAndType({
-    cardName: card.name,
-    attachmentCount: attachments?.length || 0
-  });
+  const { paid, type, multiAllowed } = decidePaidAndType({ cardName: card.name, attachmentCount: attachments?.length || 0 });
 
-  // 2) create ad (Phase 1: only Primary Text as message)
-  const { adId } = await createSocialAdWithMessage({ campaignId, card, paid, type, primaryText: meta.primary });
+  let socialAdId = '';
+  let uploadedSlides = [];
 
-  // 3) upload slides (Phase 2: per-slide meta)
-  const uploaded = await uploadSlidesToAd({
-    cardId: card.id,
-    adId,
-    attachments,
-    meta,
-    allowMultiple: !!multiAllowed
-  });
+  const singleAsset = (attachments?.length || 0) === 1 && (type === 'post' || type === 'story');
+  if (singleAsset) {
+    // Single social via /ads (message + meta + file)
+    const media = await downloadAttachmentBuffer(card.id, attachments[0]); // {buffer, filename}
+    socialAdId = await createSocialSingleGraphicViaAds({
+      campaignId, card, meta, media, type, paid
+    });
+  } else {
+    // Carousel social via social-ads + slides
+    const { adId } = await createSocialAdWithMessage({ campaignId, card, paid, type, primaryText: meta.primary });
+    socialAdId = adId;
+    uploadedSlides = await uploadSlidesToAd({ cardId: card.id, adId: socialAdId, attachments, meta, allowMultiple: !!multiAllowed });
+  }
 
-  // 4) preview URL (CSV code → env override → API)
+  // 2) Display 300×600 (optional)
+  const wantsDisplay = /\bdisplay\b/i.test(card.name) || /\b300\D*600\b/i.test(card.name);
+  let displayAdId = '';
+  let displayPicked = '';
+  try {
+    const asset = await selectDisplay300x600Asset(card.id, attachments);
+    if (asset || wantsDisplay) {
+      if (!asset) throw new Error('Requested display but no 300x600 GIF/PNG found');
+      displayPicked = asset.filename;
+      const lp = extractLandingPageUrlOnly(card) || meta.url || '';
+      displayAdId = await createDisplay300x600ViaAds({ campaignId, card, asset, landingUrl: lp });
+    }
+  } catch (e) {
+    console.warn('DISPLAY /ads skipped:', e.message);
+  }
+
+  // 3) Preview URL for social ad
   let previewUrl = '';
   try {
     let campaignCode = mapping.campaignCode || ADPILER_CAMPAIGN_CODE_OVERRIDE || '';
     if (!campaignCode) campaignCode = await getCampaignCodeViaApi(campaignId);
-    if (campaignCode) previewUrl = buildPreviewUrl({ domain: ADPILER_PREVIEW_DOMAIN, campaignCode, adId });
-  } catch (e) {
-    console.warn('Preview URL build warning:', e.message);
-  }
+    if (campaignCode) previewUrl = buildPreviewUrl({ domain: ADPILER_PREVIEW_DOMAIN, campaignCode, adId: socialAdId });
+  } catch (e) { console.warn('Preview URL build warning:', e.message); }
 
-  // 5) Trello comment
+  // 4) Trello comment
   if (postTrelloComment) {
     const lines = [];
-    lines.push(`Created AdPiler Social Ad (id: ${adId}, paid: ${paid ? 'true' : 'false'}, type: ${type}).`);
-    lines.push(`Uploaded ${uploaded.length} slide(s) out of ${attachments?.length || 0}:`);
-    for (const u of uploaded) lines.push(`• ${u.filename || u.attachmentId}`);
+    lines.push(`✅ Social ${singleAsset ? 'single (/ads)' : 'carousel (social-ads)'} created → id: ${socialAdId}, paid: ${paid ? 'true':'false'}, type: ${type}.`);
+    if (!singleAsset) lines.push(`   Uploaded ${uploadedSlides.length} slide(s) out of ${attachments?.length || 0}.`);
+    if (displayAdId)  lines.push(`✅ Display 300x600 (/ads) id: ${displayAdId}${displayPicked?` (file: ${displayPicked})`:''}.`);
     lines.push('—');
-    if (meta.primary)     lines.push(`Primary Text: ${meta.primary.substring(0,120)}${meta.primary.length>120?'…':''}`);
-    if (meta.headline)    lines.push(`Headline: ${meta.headline}`);
-    if (meta.cta)         lines.push(`CTA: ${meta.cta}`);
-    if (meta.url)         lines.push(`URL: ${meta.url}`);
-    if (previewUrl)       lines.push(previewUrl);
+    if (meta.primary)  lines.push(`Primary Text: ${meta.primary.substring(0,120)}${meta.primary.length>120?'…':''}`);
+    if (meta.headline) lines.push(`Headline: ${meta.headline}`);
+    if (meta.cta)      lines.push(`CTA: ${meta.cta}`);
+    if (meta.url)      lines.push(`URL: ${meta.url}`);
+    if (previewUrl)    lines.push(previewUrl);
     try { await postTrelloComment(card.id, lines.join('\n')); } catch {}
   }
 
-  return { adId, previewUrls: previewUrl ? [previewUrl] : [] };
+  const out = { adId: socialAdId, previewUrls: previewUrl ? [previewUrl] : [] };
+  if (displayAdId) out.displayAdId = displayAdId;
+  return out;
 }
 
 module.exports = { uploadToAdpiler };
