@@ -136,13 +136,21 @@ function extractAdMetaFromCard(card) {
   const isBlank = (s) => !s || /^leave\s+blank$/i.test(String(s).trim());
 
   const desc = card.desc || '';
+
+  // Grab a label from the card DESCRIPTION, allowing **Label**: and multi-line values
+  // until the next "Something:" line or end of text.
   const grab = (label) => {
-    // allow markdown wrappers: **Label**: value
-    const rx = new RegExp('^\\s*[*_~`]*' + label + '[*_~`]*\\s*:\\s*(.+)$', 'im');
+    const rx = new RegExp(
+      '^\\s*[*_~`]*' + label + '[*_~`]*\\s*:\\s*' +                    // the label
+      '([\\s\\S]+?)' +                                                 // value (multi-line, non-greedy)
+      '(?=\\n\\s*[*_~`]*[A-Za-z][^:\\n]{0,80}\\s*:\\s*|$)',            // stop at next "X:" or end
+      'im'
+    );
     const m = desc.match(rx);
-    return m ? m[1].trim() : '';
+    return m ? m[1].replace(/\r?\n+/g, ' ').trim() : '';
   };
 
+  // Parse from checklist named "Ad Meta" (allow markdown label and multi-line value)
   let clVals = {};
   try {
     const metaChecklist = (card.checklists || []).find(cl =>
@@ -151,15 +159,18 @@ function extractAdMetaFromCard(card) {
     if (metaChecklist) {
       for (const it of metaChecklist.checkItems || []) {
         const txt = String(it.name || '');
-        const mm = txt.match(/^\s*([^:]+)\s*:\s*(.+)$/);
+        // key: anything up to ":", value: everything after (multi-line)
+        const mm = txt.match(/^\s*([^:]+)\s*:\s*([\s\S]+)$/);
         if (mm) {
-          const key = String(mm[1]).replace(/[*_`~]/g,'').toLowerCase().trim().replace(/\s+/g,' ');
-          clVals[key] = mm[2].trim();
+          const key = String(mm[1]).replace(/[*_`~]/g, '').toLowerCase().trim().replace(/\s+/g, ' ');
+          const value = String(mm[2]).replace(/\r?\n+/g, ' ').trim();   // collapse newlines
+          clVals[key] = value;
         }
       }
     }
   } catch {}
 
+  // prefer checklist → then description → else empty
   const pick = (label, ...aliases) => {
     const keys = [label, ...aliases].map(k => k.toLowerCase());
     for (const k of keys) if (clVals[k]) return clVals[k];
@@ -187,11 +198,6 @@ function extractAdMetaFromCard(card) {
     url:         cleanedUrl,
     displayLink
   };
-}
-
-function derivePageName(cardName) {
-  const m = (cardName || '').split(':')[0].trim();
-  return m || DEFAULT_PAGE_NAME;
 }
 
 // ---------- HTTP HELPERS ----------
