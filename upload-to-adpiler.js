@@ -1,5 +1,5 @@
 /**
- * Trello → AdPiler uploader (Display, Post, Post Carousel)
+ * Trello → AdPiler uploader (Display, Post, Post Carousel) + MP4 support for Post
  *
  * Modes:
  *  - Display (300x600) → POST /campaigns/{campaign}/ads                  (file + width/height + landing_page_url)
@@ -7,11 +7,14 @@
  *  - Post Carousel →       POST /campaigns/{campaign}/social-ads         (create) → /social-ads/{ad}/slides (upload many)
  *
  * Auto mode selection (unless ADPILER_FORCE_MODE=display|post|post-carousel):
- *  1) ≥2 square (1:1) images (e.g., 1080×1080, 1200×1200) → Post Carousel
+ *  1) ≥2 square (1:1) images → Post Carousel
  *  2) else ≥2 non-display images (NOT 300×600) → Post Carousel
  *  3) else exactly 1 square → Post (single)
  *  4) else if title hints "display" or a true 300×600 GIF/PNG exists → Display
  *  5) else → Post (single)
+ *
+ * Single Post media preference:
+ *  1) square image → 2) first video (.mp4/.mov/.m4v) → 3) first attachment
  *
  * Labels tolerate markdown wrappers (e.g., **Primary Text**:).
  */
@@ -258,12 +261,12 @@ function decidePaid({ cardName }) {
 function _nameLooks300x600(n=''){ return /\b300\D*600\b/i.test(String(n||'')); }
 function _isGifOrPng(n='',m=''){ const name=String(n||'').toLowerCase(); const mime=String(m||'').toLowerCase(); return name.endsWith('.gif')||name.endsWith('.png')||/image\/(gif|png)/.test(mime); }
 function _isImageName(n=''){ return /\.(png|jpe?g|gif|webp)$/i.test(String(n||'')); }
+function _isVideoName(n=''){ return /\.(mp4|mov|m4v)$/i.test(String(n||'')); }
 
-// Collect square (1:1) assets; if dimensions unknown, treat non-300x600 images as eligible
 async function collectSquareAssets(cardId, attachments = []) {
   const out = [];
   for (const att of attachments || []) {
-    if (!att?.id || !_isImageName(att.name||'')) continue;
+    if (!att?.id || !_isImageName(att.name||'')) continue; // images only for “square”
     try {
       const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
       const fname = filename || att.name || `asset-${att.id}`;
@@ -291,12 +294,23 @@ async function collectSquareAssets(cardId, attachments = []) {
   return out;
 }
 
-function looksDisplayNameOnly(n=''){ return _nameLooks300x600(n); }
-
 function collectNonDisplayImages(attachments = []) {
   return (attachments || []).filter(a =>
-    a?.name && _isImageName(a.name) && !looksDisplayNameOnly(a.name)
+    a?.name && _isImageName(a.name) && !_nameLooks300x600(a.name)
   );
+}
+
+// NEW: pick first video for Post fallback (.mp4/.mov/.m4v)
+async function pickFirstVideo(cardId, attachments = []) {
+  const vid = (attachments || []).find(a => a?.name && _isVideoName(a.name));
+  if (!vid) return null;
+  try {
+    const { buffer, filename } = await downloadAttachmentBuffer(cardId, vid);
+    return { buffer, filename };
+  } catch (e) {
+    console.warn('video pick failed:', e.message);
+    return null;
+  }
 }
 
 async function pickFirstAttachment(cardId, attachments=[]) {
@@ -313,7 +327,7 @@ async function pickFirstAttachment(cardId, attachments=[]) {
 async function pickDisplay300x600(cardId, attachments = []) {
   const cand=[];
   for (const att of attachments||[]) {
-    if (!att?.id || !_isGifOrPng(att.name, att.mimeType)) continue;
+    if (!att?.id || !_isGifOrPng(att.name, att.mimeType)) continue; // Display: GIF/PNG only
     try {
       const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
       let w=0,h=0;
@@ -445,6 +459,7 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
     const displayAsset = await pickDisplay300x600(card.id, attachments);
     const squareAssets = await collectSquareAssets(card.id, attachments);
     const nonDisplayImages = collectNonDisplayImages(attachments);
+    const firstVideo = await pickFirstVideo(card.id, attachments);
     const firstAsset = await pickFirstAttachment(card.id, attachments);
 
     if (!mode) {
@@ -463,8 +478,9 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
       displayAdId = await createDisplay300x600ViaAds({ campaignId, card, asset: displayAsset, landingUrl: lp });
 
     } else if (mode === 'post') {
-      // Create Social Ad (type=post), then upload exactly one slide (prefer 1:1)
-      const media = squareAssets[0] || firstAsset;
+      // Create Social Ad (type=post), then upload exactly one slide.
+      // Preference: square image → first video → first attachment
+      const media = squareAssets[0] || firstVideo || firstAsset;
       if (!media) throw new Error('Post mode selected but no usable attachment found.');
 
       const { adId } = await createSocialAd({ campaignId, card, paid, type: 'post', primaryText: meta.primary });
@@ -482,9 +498,9 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
       const { adId } = await createSocialAd({ campaignId, card, paid, type: 'post-carousel', primaryText: meta.primary });
       socialAdId = adId;
 
-      // Choose which files become slides: prefer squares → else non-display images → else everything
+      // Slides: prefer squares → else non-display images → else everything (images only)
       const slideSet = squareAssets.length ? squareAssets
-                        : (nonDisplayImages.length ? nonDisplayImages : attachments);
+                        : (nonDisplayImages.length ? nonDisplayImages : attachments.filter(a => a?.name && _isImageName(a.name)));
 
       uploadedCount = await uploadSlidesToAd({
         cardId: card.id,
