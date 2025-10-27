@@ -1,5 +1,5 @@
 /**
- * Trello → AdPiler uploader (Display, Post, Post Carousel) + MP4 support for Post
+ * Trello → AdPiler uploader (Display, Post, Post Carousel) + video support for Post
  *
  * Modes:
  *  - Display (300x600) → POST /campaigns/{campaign}/ads                  (file + width/height + landing_page_url)
@@ -16,7 +16,7 @@
  * Single Post media preference:
  *  1) square image → 2) first video (.mp4/.mov/.m4v) → 3) first attachment
  *
- * Labels tolerate markdown wrappers (e.g., **Primary Text**:).
+ * Labels tolerate markdown wrappers (e.g., **Primary Text**:). Multiline values supported.
  */
 
 const fetch = require('node-fetch');
@@ -45,7 +45,8 @@ const {
   ADPILER_CAMPAIGN_CODE_OVERRIDE,
   ADPILER_API_BASE,
   ADPILER_BASE_URL,
-  ADPILER_FORCE_MODE // 'display' | 'post' | 'post-carousel'
+  ADPILER_FORCE_MODE, // 'display' | 'post' | 'post-carousel'
+  USE_DESCRIPTION_AS_MESSAGE_FALLBACK = 'true'
 } = process.env;
 
 const _API_BASE = (ADPILER_API_BASE || ADPILER_BASE_URL || '').trim();
@@ -137,20 +138,19 @@ function extractAdMetaFromCard(card) {
 
   const desc = card.desc || '';
 
-  // Grab a label from the card DESCRIPTION, allowing **Label**: and multi-line values
-  // until the next "Something:" line or end of text.
+  // From DESCRIPTION: allow **Label**: and capture multi-line value to next "Something:" or end.
   const grab = (label) => {
     const rx = new RegExp(
-      '^\\s*[*_~`]*' + label + '[*_~`]*\\s*:\\s*' +                    // the label
-      '([\\s\\S]+?)' +                                                 // value (multi-line, non-greedy)
-      '(?=\\n\\s*[*_~`]*[A-Za-z][^:\\n]{0,80}\\s*:\\s*|$)',            // stop at next "X:" or end
+      '^\\s*[*_~`]*' + label + '[*_~`]*\\s*:\\s*' +
+      '([\\s\\S]+?)' +
+      '(?=\\n\\s*[*_~`]*[A-Za-z][^:\\n]{0,80}\\s*:\\s*|$)',
       'im'
     );
     const m = desc.match(rx);
     return m ? m[1].replace(/\r?\n+/g, ' ').trim() : '';
   };
 
-  // Parse from checklist named "Ad Meta" (allow markdown label and multi-line value)
+  // From CHECKLIST "Ad Meta": allow markdown in keys; capture whole multi-line value.
   let clVals = {};
   try {
     const metaChecklist = (card.checklists || []).find(cl =>
@@ -159,18 +159,17 @@ function extractAdMetaFromCard(card) {
     if (metaChecklist) {
       for (const it of metaChecklist.checkItems || []) {
         const txt = String(it.name || '');
-        // key: anything up to ":", value: everything after (multi-line)
         const mm = txt.match(/^\s*([^:]+)\s*:\s*([\s\S]+)$/);
         if (mm) {
           const key = String(mm[1]).replace(/[*_`~]/g, '').toLowerCase().trim().replace(/\s+/g, ' ');
-          const value = String(mm[2]).replace(/\r?\n+/g, ' ').trim();   // collapse newlines
+          const value = String(mm[2]).replace(/\r?\n+/g, ' ').trim();
           clVals[key] = value;
         }
       }
     }
   } catch {}
 
-  // prefer checklist → then description → else empty
+  // prefer checklist → then description
   const pick = (label, ...aliases) => {
     const keys = [label, ...aliases].map(k => k.toLowerCase());
     for (const k of keys) if (clVals[k]) return clVals[k];
@@ -198,6 +197,11 @@ function extractAdMetaFromCard(card) {
     url:         cleanedUrl,
     displayLink
   };
+}
+
+function derivePageName(cardName) {
+  const first = (cardName || '').split(':')[0].trim();
+  return first || DEFAULT_PAGE_NAME;
 }
 
 // ---------- HTTP HELPERS ----------
@@ -269,10 +273,11 @@ function _isGifOrPng(n='',m=''){ const name=String(n||'').toLowerCase(); const m
 function _isImageName(n=''){ return /\.(png|jpe?g|gif|webp)$/i.test(String(n||'')); }
 function _isVideoName(n=''){ return /\.(mp4|mov|m4v)$/i.test(String(n||'')); }
 
+// Collect square (1:1) assets; if dimensions unknown, treat non-300x600 images as eligible
 async function collectSquareAssets(cardId, attachments = []) {
   const out = [];
   for (const att of attachments || []) {
-    if (!att?.id || !_isImageName(att.name||'')) continue; // images only for “square”
+    if (!att?.id || !_isImageName(att.name||'')) continue;
     try {
       const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
       const fname = filename || att.name || `asset-${att.id}`;
@@ -306,7 +311,6 @@ function collectNonDisplayImages(attachments = []) {
   );
 }
 
-// NEW: pick first video for Post fallback (.mp4/.mov/.m4v)
 async function pickFirstVideo(cardId, attachments = []) {
   const vid = (attachments || []).find(a => a?.name && _isVideoName(a.name));
   if (!vid) return null;
@@ -333,7 +337,7 @@ async function pickFirstAttachment(cardId, attachments=[]) {
 async function pickDisplay300x600(cardId, attachments = []) {
   const cand=[];
   for (const att of attachments||[]) {
-    if (!att?.id || !_isGifOrPng(att.name, att.mimeType)) continue; // Display: GIF/PNG only
+    if (!att?.id || !_isGifOrPng(att.name, att.mimeType)) continue;
     try {
       const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
       let w=0,h=0;
@@ -380,7 +384,6 @@ async function createDisplay300x600ViaAds({ campaignId, card, asset, landingUrl 
 
 // ---------- Social ads via /social-ads ----------
 async function createSocialAd({ campaignId, card, paid, type, primaryText }) {
-  // type: 'post' | 'post-carousel' | 'story' | 'story-carousel'
   const form = new FormData();
   form.append('name', card.name);
   form.append('network', FIXED_NETWORK);
@@ -484,12 +487,17 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
       displayAdId = await createDisplay300x600ViaAds({ campaignId, card, asset: displayAsset, landingUrl: lp });
 
     } else if (mode === 'post') {
+      // Primary text fallback (never leave message empty)
+      const messageFallbackOk = String(USE_DESCRIPTION_AS_MESSAGE_FALLBACK).toLowerCase() !== 'false';
+      const primaryForMessage = (meta.primary && meta.primary.trim()) ||
+                                (messageFallbackOk ? (meta.description && meta.description.trim()) : '') || '';
+
       // Create Social Ad (type=post), then upload exactly one slide.
       // Preference: square image → first video → first attachment
       const media = squareAssets[0] || firstVideo || firstAsset;
       if (!media) throw new Error('Post mode selected but no usable attachment found.');
 
-      const { adId } = await createSocialAd({ campaignId, card, paid, type: 'post', primaryText: meta.primary });
+      const { adId } = await createSocialAd({ campaignId, card, paid, type: 'post', primaryText: primaryForMessage });
       socialAdId = adId;
 
       await uploadSlidesToAd({
@@ -501,7 +509,11 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
       });
 
     } else if (mode === 'post-carousel') {
-      const { adId } = await createSocialAd({ campaignId, card, paid, type: 'post-carousel', primaryText: meta.primary });
+      const messageFallbackOk = String(USE_DESCRIPTION_AS_MESSAGE_FALLBACK).toLowerCase() !== 'false';
+      const primaryForMessage = (meta.primary && meta.primary.trim()) ||
+                                (messageFallbackOk ? (meta.description && meta.description.trim()) : '') || '';
+
+      const { adId } = await createSocialAd({ campaignId, card, paid, type: 'post-carousel', primaryText: primaryForMessage });
       socialAdId = adId;
 
       // Slides: prefer squares → else non-display images → else everything (images only)
